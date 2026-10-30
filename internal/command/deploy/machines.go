@@ -1,0 +1,932 @@
+package deploy
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/avast/retry-go/v4"
+	"github.com/google/shlex"
+	"github.com/logrusorgru/aurora"
+	"github.com/morikuni/aec"
+	"github.com/samber/lo"
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/fly-go/flaps"
+	"github.com/superfly/flyctl/internal/appconfig"
+	"github.com/superfly/flyctl/internal/buildinfo"
+	"github.com/superfly/flyctl/internal/cmdutil"
+	"github.com/superfly/flyctl/internal/command/deploy/statics"
+	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/internal/flyutil"
+	"github.com/superfly/flyctl/internal/machine"
+	"github.com/superfly/flyctl/internal/prompt"
+	"github.com/superfly/flyctl/internal/tracing"
+	"github.com/superfly/flyctl/internal/uiex"
+	"github.com/superfly/flyctl/internal/uiexutil"
+	"github.com/superfly/flyctl/iostreams"
+	"github.com/superfly/flyctl/terminal"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+const (
+	DefaultWaitTimeout            = 5 * time.Minute
+	DefaultReleaseCommandTimeout  = 5 * time.Minute
+	DefaultLeaseTtl               = 13 * time.Second
+	DefaultMaxUnavailable         = 0.33
+	DefaultVolumeInitialSizeGB    = 1
+	DefaultGPUVolumeInitialSizeGB = 100
+)
+
+type MachineDeployment interface {
+	DeployMachinesApp(context.Context) error
+}
+
+type MachineDeploymentArgs struct {
+	App                   *flaps.App
+	DeploymentImage       string
+	Strategy              string
+	EnvFromFlags          []string
+	PrimaryRegionFlag     string
+	SkipSmokeChecks       bool
+	SkipHealthChecks      bool
+	SkipDNSChecks         bool
+	SkipReleaseCommand    bool
+	MaxUnavailable        *float64
+	RestartOnly           bool
+	WaitTimeout           *time.Duration
+	StopSignal            string
+	LeaseTimeout          *time.Duration
+	ReleaseCmdTimeout     *time.Duration
+	Guest                 *fly.MachineGuest
+	IncreasedAvailability bool
+	AllocIP               string
+	Org                   string
+	UpdateOnly            bool
+	Files                 []*fly.File
+	ExcludeRegions        map[string]bool
+	OnlyRegions           map[string]bool
+	ExcludeMachines       map[string]bool
+	OnlyMachines          map[string]bool
+	ProcessGroups         map[string]bool
+	MaxConcurrent         int
+	VolumeInitialSize     int
+	RestartPolicy         *fly.MachineRestartPolicy
+	RestartMaxRetries     int
+	DeployRetries         int
+	BuildID               int64
+	BuilderID             string
+}
+
+func argsFromManifest(manifest *DeployManifest, app *flaps.App) MachineDeploymentArgs {
+	return MachineDeploymentArgs{
+		App:                   app,
+		DeploymentImage:       manifest.DeploymentImage,
+		Strategy:              manifest.Strategy,
+		EnvFromFlags:          manifest.EnvFromFlags,
+		PrimaryRegionFlag:     manifest.PrimaryRegionFlag,
+		SkipSmokeChecks:       manifest.SkipSmokeChecks,
+		SkipHealthChecks:      manifest.SkipHealthChecks,
+		SkipDNSChecks:         manifest.SkipDNSChecks,
+		SkipReleaseCommand:    manifest.SkipReleaseCommand,
+		MaxUnavailable:        manifest.MaxUnavailable,
+		RestartOnly:           manifest.RestartOnly,
+		WaitTimeout:           manifest.WaitTimeout,
+		StopSignal:            manifest.StopSignal,
+		LeaseTimeout:          manifest.LeaseTimeout,
+		ReleaseCmdTimeout:     manifest.ReleaseCmdTimeout,
+		Guest:                 manifest.Guest,
+		IncreasedAvailability: manifest.IncreasedAvailability,
+		UpdateOnly:            manifest.UpdateOnly,
+		Files:                 manifest.Files,
+		ExcludeRegions:        manifest.ExcludeRegions,
+		OnlyRegions:           manifest.OnlyRegions,
+		ExcludeMachines:       manifest.ExcludeMachines,
+		OnlyMachines:          manifest.OnlyMachines,
+		ProcessGroups:         manifest.ProcessGroups,
+		MaxConcurrent:         manifest.MaxConcurrent,
+		VolumeInitialSize:     manifest.VolumeInitialSize,
+		RestartPolicy:         manifest.RestartPolicy,
+		RestartMaxRetries:     manifest.RestartMaxRetries,
+		DeployRetries:         manifest.DeployRetries,
+	}
+}
+
+type machineDeployment struct {
+	// apiClient is a client to use web GraphQL.
+	apiClient webClient
+	// flapsClient is a client to use flaps.
+	flapsClient flapsutil.FlapsClient
+	// uiexClient is a client to use api.fly.io, which is implemented by both ui-ex and web.
+	uiexClient uiexutil.Client
+	io         *iostreams.IOStreams
+	colorize   *iostreams.ColorScheme
+	app        *flaps.App
+	appConfig  *appconfig.Config
+	img        string
+	// machineSet is this application's machines.
+	machineSet            machine.MachineSet
+	releaseCommandMachine machine.MachineSet
+	availableVolumeCounts map[string]map[string]int
+	strategy              string
+	releaseId             string
+	releaseVersion        int
+	skipSmokeChecks       bool
+	skipHealthChecks      bool
+	skipDNSChecks         bool
+	skipReleaseCommand    bool
+	maxUnavailable        float64
+	restartOnly           bool
+	waitTimeout           time.Duration
+	stopSignal            string
+	leaseTimeout          time.Duration
+	leaseDelayBetween     time.Duration
+	releaseCmdTimeout     time.Duration
+	isFirstDeploy         bool
+	machineGuest          *fly.MachineGuest
+	increasedAvailability bool
+	listenAddressChecked  sync.Map
+	updateOnly            bool
+	excludeRegions        map[string]bool
+	onlyRegions           map[string]bool
+	excludeMachines       map[string]bool
+	onlyMachines          map[string]bool
+	processGroups         map[string]bool
+	maxConcurrent         int
+	volumeInitialSize     int
+	tigrisStatics         *statics.DeployerState
+	deployRetries         int
+	buildID               int64
+	builderID             string
+}
+
+func NewMachineDeployment(ctx context.Context, args MachineDeploymentArgs) (_ MachineDeployment, err error) {
+	var io = iostreams.FromContext(ctx)
+
+	ctx, span := tracing.GetTracer().Start(ctx, "new_machines_deployment")
+	defer span.End()
+
+	if !args.RestartOnly && args.DeploymentImage == "" {
+		return nil, fmt.Errorf("BUG: machines deployment created without specifying the image")
+	}
+	if args.RestartOnly && args.DeploymentImage != "" {
+		return nil, fmt.Errorf("BUG: restartOnly machines deployment created and specified an image")
+	}
+	appConfig, err := determineAppConfigForMachines(ctx, args.EnvFromFlags, args.PrimaryRegionFlag, args.Strategy, args.MaxUnavailable, args.Files)
+	if err != nil {
+		tracing.RecordError(ctx, span, err, "failed to determine app config for machines")
+
+		return nil, err
+	}
+
+	// TODO: Blend extraInfo into ValidationError and remove this hack
+	if err, extraInfo := appConfig.ValidateGroups(ctx, lo.Keys(args.ProcessGroups)); err != nil {
+		fmt.Fprint(io.ErrOut, extraInfo)
+		tracing.RecordError(ctx, span, err, "failed to validate process groups")
+
+		return nil, err
+	}
+
+	if args.App == nil {
+		return nil, fmt.Errorf("BUG: args.App should be set when calling this method")
+	}
+
+	flapsClient := flapsutil.ClientFromContext(ctx)
+
+	if appConfig.Deploy != nil && appConfig.Deploy.ReleaseCommand != "" {
+		_, err = shlex.Split(appConfig.Deploy.ReleaseCommand)
+		if err != nil {
+			tracing.RecordError(ctx, span, err, "failed to split release command")
+
+			return nil, err
+		}
+	}
+
+	var waitTimeout time.Duration
+	switch {
+	case args.WaitTimeout != nil:
+		waitTimeout = *args.WaitTimeout
+	case appConfig.Deploy != nil && appConfig.Deploy.WaitTimeout != nil:
+		waitTimeout = appConfig.Deploy.WaitTimeout.Duration
+	default:
+		waitTimeout = DefaultWaitTimeout
+	}
+
+	var releaseCmdTimeout time.Duration
+	switch {
+	case args.ReleaseCmdTimeout != nil:
+		releaseCmdTimeout = *args.ReleaseCmdTimeout
+	case appConfig.Deploy != nil && appConfig.Deploy.ReleaseCommandTimeout != nil:
+		releaseCmdTimeout = appConfig.Deploy.ReleaseCommandTimeout.Duration
+	default:
+		releaseCmdTimeout = DefaultReleaseCommandTimeout
+	}
+
+	var leaseTimeout time.Duration
+	switch {
+	case args.LeaseTimeout != nil:
+		leaseTimeout = *args.LeaseTimeout
+	default:
+		leaseTimeout = DefaultLeaseTtl
+	}
+
+	leaseDelayBetween := (leaseTimeout - 1*time.Second) / 3
+	if waitTimeout != DefaultWaitTimeout || leaseTimeout != DefaultLeaseTtl {
+		terminal.Infof("Using wait timeout: %s lease timeout: %s delay between lease refreshes: %s\n", waitTimeout, leaseTimeout, leaseDelayBetween)
+	}
+
+	apiClient := flyutil.ClientFromContext(ctx)
+	uiexClient := uiexutil.ClientFromContext(ctx)
+
+	maxUnavailable := DefaultMaxUnavailable
+	if appConfig.Deploy != nil && appConfig.Deploy.MaxUnavailable != nil {
+		maxUnavailable = *appConfig.Deploy.MaxUnavailable
+	}
+
+	maxConcurrent := max(args.MaxConcurrent, 1)
+
+	md := &machineDeployment{
+		apiClient:             apiClient,
+		flapsClient:           flapsClient,
+		uiexClient:            uiexClient,
+		io:                    io,
+		colorize:              io.ColorScheme(),
+		app:                   args.App,
+		appConfig:             appConfig,
+		img:                   args.DeploymentImage,
+		skipSmokeChecks:       args.SkipSmokeChecks,
+		skipHealthChecks:      args.SkipHealthChecks,
+		skipDNSChecks:         args.SkipDNSChecks,
+		skipReleaseCommand:    args.SkipReleaseCommand,
+		restartOnly:           args.RestartOnly,
+		maxUnavailable:        maxUnavailable,
+		waitTimeout:           waitTimeout,
+		stopSignal:            args.StopSignal,
+		leaseTimeout:          leaseTimeout,
+		leaseDelayBetween:     leaseDelayBetween,
+		releaseCmdTimeout:     releaseCmdTimeout,
+		increasedAvailability: args.IncreasedAvailability,
+		updateOnly:            args.UpdateOnly,
+		machineGuest:          args.Guest,
+		excludeRegions:        args.ExcludeRegions,
+		onlyRegions:           args.OnlyRegions,
+		excludeMachines:       args.ExcludeMachines,
+		onlyMachines:          args.OnlyMachines,
+		maxConcurrent:         maxConcurrent,
+		volumeInitialSize:     args.VolumeInitialSize,
+		processGroups:         args.ProcessGroups,
+		deployRetries:         args.DeployRetries,
+		buildID:               args.BuildID,
+		builderID:             args.BuilderID,
+	}
+	if err := md.setStrategy(); err != nil {
+		tracing.RecordError(ctx, span, err, "failed to set strategy")
+
+		return nil, err
+	}
+
+	if err := md.setMachinesForDeployment(ctx); err != nil {
+		tracing.RecordError(ctx, span, err, "failed to set machines for first deployemt")
+
+		return nil, err
+	}
+	if err := md.setVolumes(ctx); err != nil {
+		tracing.RecordError(ctx, span, err, "failed to set volumes")
+
+		return nil, err
+	}
+	if err := md.setImg(ctx); err != nil {
+		tracing.RecordError(ctx, span, err, "failed to set img")
+
+		return nil, err
+	}
+	if err := md.setFirstDeploy(ctx); err != nil {
+		tracing.RecordError(ctx, span, err, "failed to set first depoyment")
+
+		return nil, err
+	}
+
+	// Provisioning must come after setVolumes
+	if err := md.provisionFirstDeploy(ctx, args.AllocIP, args.Org); err != nil {
+		tracing.RecordError(ctx, span, err, "failed to provision first depoloy")
+
+		return nil, err
+	}
+
+	// validations must happen after every else
+	if err := md.validateVolumeConfig(ctx); err != nil {
+		tracing.RecordError(ctx, span, err, "failed to validate volume config")
+
+		return nil, err
+	}
+	if err = md.createReleaseInBackend(ctx); err != nil {
+		tracing.RecordError(ctx, span, err, "failed to create release in backend")
+
+		return nil, err
+	}
+
+	span.SetAttributes(md.ToSpanAttributes()...)
+
+	return md, nil
+}
+
+func (md *machineDeployment) setFirstDeploy(_ context.Context) error {
+	// Due to https://github.com/superfly/web/issues/1397 we have to be extra careful
+	// by checking for any existent machine.
+	// This is not exaustive as the app could still be scaled down to zero but the
+	// workaround works better for now until it is fixed
+	md.isFirstDeploy = md.isFirstDeploy || (!md.app.Deployed() && md.machineSet.IsEmpty())
+
+	return nil
+}
+
+func (md *machineDeployment) setMachinesForDeployment(ctx context.Context) error {
+	ctx, span := tracing.GetTracer().Start(ctx, "set_machines_for_deployment")
+	defer span.End()
+
+	machines, releaseCmdMachine, err := md.flapsClient.ListFlyAppsMachines(ctx, md.app.Name)
+	if err != nil {
+		tracing.RecordError(ctx, span, err, "failed to list machines")
+
+		return err
+	}
+
+	var activeMachines []*fly.Machine
+	activeMachinesLoaded := false
+	loadActiveMachines := func() error {
+		if activeMachinesLoaded {
+			return nil
+		}
+
+		var err error
+		activeMachines, err = md.flapsClient.ListActive(ctx, md.app.Name)
+		if err != nil {
+			tracing.RecordError(ctx, span, err, "failed to list machines")
+
+			return err
+		}
+		activeMachinesLoaded = true
+
+		return nil
+	}
+
+	nMachines := len(machines)
+	if nMachines == 0 {
+		terminal.Debug("Found no machines that are part of Fly Apps Platform. Checking for active machines...")
+		if err := loadActiveMachines(); err != nil {
+			return err
+		}
+	}
+
+	filtersApplied := map[string]struct{}{}
+	machines = slices.DeleteFunc(machines, func(m *fly.Machine) bool {
+		return md.machineFilteredFromDeployment(m, filtersApplied)
+	})
+
+	if md.strategy == "bluegreen" && len(machines) == 0 {
+		if err := loadActiveMachines(); err != nil {
+			return err
+		}
+
+		if err := md.validateNoDetachedBluegreenMachines(activeMachines); err != nil {
+			tracing.RecordError(ctx, span, err, "failed to validate bluegreen machines")
+
+			return err
+		}
+	}
+
+	if nMachines == 0 && len(activeMachines) > 0 {
+		fmt.Fprintf(md.io.ErrOut, "%s Your app doesn't have any Fly Launch machines, so we'll create one now. Learn more at \nhttps://fly.io/docs/launch/\n\n", aurora.Yellow("[WARNING]"))
+		md.isFirstDeploy = true
+	}
+
+	if len(filtersApplied) > 0 {
+		s := ""
+		if len(filtersApplied) > 1 {
+			s = "s"
+		}
+
+		filtersAppliedStr := strings.Join(slices.Collect(maps.Keys(filtersApplied)), "/")
+
+		fmt.Fprintf(md.io.ErrOut, "%s filter%s applied, deploying to %d/%d machines\n", filtersAppliedStr, s, len(machines), nMachines)
+	}
+
+	for _, m := range machines {
+		if m.Config != nil && m.Config.Metadata != nil {
+			m.Config.Metadata[fly.MachineConfigMetadataKeyFlyctlVersion] = buildinfo.Version().String()
+			if m.Config.Metadata[fly.MachineConfigMetadataKeyFlyProcessGroup] == "" {
+				m.Config.Metadata[fly.MachineConfigMetadataKeyFlyProcessGroup] = md.appConfig.DefaultProcessName()
+			}
+			if md.builderID != "" {
+				m.Config.Metadata["fly_builder_id"] = md.builderID
+			}
+		}
+	}
+
+	md.machineSet = machine.NewMachineSet(md.flapsClient, md.io, md.app.Name, machines, true)
+	var releaseCmdSet []*fly.Machine
+	if releaseCmdMachine != nil {
+		releaseCmdSet = []*fly.Machine{releaseCmdMachine}
+	}
+	md.releaseCommandMachine = machine.NewMachineSet(md.flapsClient, md.io, md.app.Name, releaseCmdSet, true)
+
+	return nil
+}
+
+func (md *machineDeployment) machineFilteredFromDeployment(m *fly.Machine, filtersApplied map[string]struct{}) bool {
+	return md.machineFilteredFromDeploymentByProcessGroup(m, filtersApplied, m.ProcessGroup())
+}
+
+func (md *machineDeployment) machineFilteredFromDeploymentByProcessGroup(m *fly.Machine, filtersApplied map[string]struct{}, processGroup string) bool {
+	if len(md.onlyRegions) > 0 {
+		filtersApplied["--regions"] = struct{}{}
+
+		if !md.onlyRegions[m.Region] {
+			return true
+		}
+	}
+
+	if len(md.excludeRegions) > 0 {
+		filtersApplied["--exclude-regions"] = struct{}{}
+
+		if md.excludeRegions[m.Region] {
+			return true
+		}
+	}
+
+	if len(md.onlyMachines) > 0 {
+		filtersApplied["--only-machines"] = struct{}{}
+
+		if !md.onlyMachines[m.ID] {
+			return true
+		}
+	}
+
+	if len(md.excludeMachines) > 0 {
+		filtersApplied["--exclude-machines"] = struct{}{}
+
+		if md.excludeMachines[m.ID] {
+			return true
+		}
+	}
+
+	if len(md.processGroups) > 0 {
+		filtersApplied["--process-groups"] = struct{}{}
+
+		if !md.processGroups[processGroup] {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (md *machineDeployment) machineProcessGroup(m *fly.Machine) string {
+	group := m.ProcessGroup()
+	if group != "" {
+		return group
+	}
+
+	return md.appConfig.DefaultProcessName()
+}
+
+func (md *machineDeployment) validateNoDetachedBluegreenMachines(activeMachines []*fly.Machine) error {
+	groupsInConfig := md.ProcessNames()
+	ignoredFilters := map[string]struct{}{}
+	var detachedMachines []string
+	for _, m := range activeMachines {
+		if m.IsFlyAppsPlatform() {
+			continue
+		}
+		group := md.machineProcessGroup(m)
+		if md.machineFilteredFromDeploymentByProcessGroup(m, ignoredFilters, group) {
+			continue
+		}
+
+		if !slices.Contains(groupsInConfig, group) {
+			continue
+		}
+
+		detachedMachines = append(detachedMachines, fmt.Sprintf("%s (%s)", m.ID, group))
+	}
+	if len(detachedMachines) == 0 {
+		return nil
+	}
+
+	slices.Sort(detachedMachines)
+
+	return fmt.Errorf(
+		"bluegreen deployment can't safely continue because active Machines outside Fly Launch management belong to configured process groups: %s. "+
+			"If these Machines should be managed by deploys, make sure they have %s=%s and the correct %s metadata; otherwise destroy or move them before using bluegreen",
+		strings.Join(detachedMachines, ", "),
+		fly.MachineConfigMetadataKeyFlyPlatformVersion,
+		fly.MachineFlyPlatformVersion2,
+		fly.MachineConfigMetadataKeyFlyProcessGroup,
+	)
+}
+
+func (md *machineDeployment) setVolumes(ctx context.Context) error {
+	if len(md.appConfig.Mounts) == 0 {
+		return nil
+	}
+
+	volumes, err := md.flapsClient.GetVolumes(ctx, md.app.Name)
+	if err != nil {
+		return fmt.Errorf("Error fetching application volumes: %w", err)
+	}
+
+	unattached := lo.Filter(volumes, func(v fly.Volume, _ int) bool {
+		return v.AttachedAllocation == nil && v.AttachedMachine == nil && v.HostStatus == "ok"
+	})
+
+	md.availableVolumeCounts = lo.MapValues(
+		lo.GroupBy(unattached, func(v fly.Volume) string {
+			return v.Name
+		}),
+		func(volumes []fly.Volume, _ string) map[string]int {
+			return lo.CountValuesBy(volumes, func(v fly.Volume) string {
+				return v.Region
+			})
+		},
+	)
+
+	return nil
+}
+
+func cloneAvailableVolumeCounts(counts map[string]map[string]int) map[string]map[string]int {
+	return lo.MapValues(counts, func(regions map[string]int, _ string) map[string]int {
+		return maps.Clone(regions)
+	})
+}
+
+// consumeAvailableVolumeCount subtracts up to requested volumes from the
+// available count for name and region. It returns the number consumed.
+func consumeAvailableVolumeCount(counts map[string]map[string]int, name, region string, requested int) int {
+	available := counts[name][region]
+	taken := min(available, requested)
+	if taken > 0 {
+		counts[name][region] -= taken
+	}
+
+	return taken
+}
+
+func (md *machineDeployment) validateVolumeConfig(ctx context.Context) error {
+	machineGroups := lo.GroupBy(
+		lo.Map(md.machineSet.GetMachines(), func(lm machine.LeasableMachine, _ int) *fly.Machine {
+			return lm.Machine()
+		}),
+		func(m *fly.Machine) string {
+			return m.ProcessGroup()
+		})
+	rolloutVolumes := cloneAvailableVolumeCounts(md.availableVolumeCounts)
+
+	for _, groupName := range md.ProcessNames() {
+		groupConfig, err := md.appConfig.Flatten(groupName)
+		if err != nil {
+			return err
+		}
+
+		switch ms := machineGroups[groupName]; len(ms) > 0 {
+		case true:
+			// For groups with machines, check the attached volumes match expected mounts
+			var mntSrc, mntDst string
+			if len(groupConfig.Mounts) > 0 {
+				mntSrc = groupConfig.Mounts[0].Source
+				mntDst = groupConfig.Mounts[0].Destination
+			}
+
+			needsVol := map[string][]string{}
+
+			for _, m := range ms {
+				mConfig := m.GetConfig()
+				if mntDst == "" && len(mConfig.Mounts) != 0 {
+					msg := fmt.Sprintf("Warning! machine %s [%s] has a volume mounted but app config does not specify a volume.\nThis usually indicates a misconfiguration.", m.ID, groupName)
+					fmt.Fprintln(md.io.ErrOut, md.colorize.Red(msg))
+
+					if !flag.GetYes(ctx) {
+						switch confirmed, err := prompt.Confirm(ctx, "Do you still want to continue and detach the volume? This will replace the machine."); {
+						case err == nil:
+							if !confirmed {
+								return fmt.Errorf(
+									"deployment cancelled: machine %s [%s] has a volume mounted but app config does not specify a volume; "+
+										"remove the volume from the machine or add a [mounts] section to fly.toml",
+									m.ID, groupName,
+								)
+							}
+						case prompt.IsNonInteractive(err):
+							return prompt.NonInteractiveError(fmt.Sprintf(
+								"machine %s [%s] has a volume mounted but app config does not specify a volume; "+
+									"add a [mounts] section to fly.toml, or run 'fly deploy --yes' to detach the volume and replace the machine",
+								m.ID, groupName,
+							))
+						default:
+							return err
+						}
+					}
+				}
+
+				if mntDst != "" && len(mConfig.Mounts) == 0 {
+					// Attaching a volume to an existing machine is not possible, but we replace the machine
+					// by another running on the same zone than the volume.
+					needsVol[mntSrc] = append(needsVol[mntSrc], m.Region)
+				}
+
+				if mms := mConfig.Mounts; len(mms) > 0 && mntSrc != "" && mms[0].Name != "" && mntSrc != mms[0].Name {
+					// TODO: Changed the attached volume to an existing machine is not possible, but it could replace the machine
+					// by another running on the same zone than the new volume.
+					return fmt.Errorf(
+						"machine %s [%s] can't update the attached volume %s with name '%s' by '%s'",
+						m.ID, groupName, mntSrc, mms[0].Volume, mms[0].Name,
+					)
+				}
+			}
+
+			// Compute the volume differences per region
+			volumeSources := lo.Keys(needsVol)
+			slices.Sort(volumeSources)
+			for _, volSrc := range volumeSources {
+				regions := needsVol[volSrc]
+				needsPerRegion := lo.CountValues(regions)
+
+				var missing []string
+				regionNames := lo.Keys(needsPerRegion)
+				slices.Sort(regionNames)
+				for _, rn := range regionNames {
+					requested := needsPerRegion[rn]
+					if count := requested - consumeAvailableVolumeCount(rolloutVolumes, volSrc, rn, requested); count > 0 {
+						missing = append(missing, fmt.Sprintf("%s=%d", rn, count))
+					}
+				}
+				if len(missing) > 0 {
+					// TODO: May change this by a prompt to create new volumes right away (?)
+					return fmt.Errorf(
+						"Process group '%s' needs volumes with name '%s' to fulfill mounts defined in fly.toml; "+
+							"Run `fly volume create %s -r REGION -n COUNT` for the following regions and counts: %s",
+						groupName, volSrc, volSrc, strings.Join(missing, " "),
+					)
+				}
+			}
+
+		case false:
+			// Check if there are unattached volumes for new groups with mounts
+			for _, m := range groupConfig.Mounts {
+				region := md.appConfig.PrimaryRegion
+				if consumeAvailableVolumeCount(rolloutVolumes, m.Source, region, 1) == 0 {
+					return fmt.Errorf(
+						"creating a new machine in group '%s' requires an unattached '%s' volume in region '%s'. Create it with `fly volume create %s --region %s`",
+						groupName, m.Source, region, m.Source, region)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (md *machineDeployment) setImg(ctx context.Context) error {
+	if md.img != "" {
+		return nil
+	}
+	release, err := uiexutil.LatestRelease(ctx, md.uiexClient, md.app.Name)
+	if err == nil && release != nil && release.ImageRef != "" {
+		md.img = release.ImageRef
+
+		return nil
+	}
+	if err == nil {
+		err = errors.New("app has no current release")
+	}
+	if !md.machineSet.IsEmpty() {
+		md.img = md.machineSet.GetMachines()[0].Machine().Config.Image
+
+		return nil
+	}
+
+	return fmt.Errorf("could not find image to use for deployment; backend error was: %w", err)
+}
+
+func (md *machineDeployment) setStrategy() error {
+	md.strategy = "rolling"
+	if md.appConfig.Deploy != nil && md.appConfig.Deploy.Strategy != "" {
+		md.strategy = md.appConfig.Deploy.Strategy
+	}
+
+	return nil
+}
+
+func (md *machineDeployment) createReleaseInBackend(ctx context.Context) error {
+	ctx, span := tracing.GetTracer().Start(ctx, "create_backend_release")
+	defer span.End()
+
+	resp, err := md.uiexClient.CreateRelease(ctx, uiex.CreateReleaseRequest{
+		AppName:    md.app.Name,
+		Strategy:   uiex.DeploymentStrategy(strings.ToUpper(md.strategy)),
+		Definition: md.appConfig,
+		Image:      md.img,
+		BuildId:    md.buildID,
+	})
+	if err != nil {
+		tracing.RecordError(ctx, span, err, "failed to create machine release")
+
+		return err
+	}
+	md.releaseId = resp.ID
+	md.releaseVersion = resp.Version
+
+	return nil
+}
+
+const (
+	// releaseStatusRetryAttempts bounds how many times a release status update is
+	// attempted before the deploy gives up.
+	releaseStatusRetryAttempts = 3
+	// releaseStatusRetryDelay is the delay before the first retry; it doubles on
+	// each subsequent attempt.
+	releaseStatusRetryDelay = 500 * time.Millisecond
+)
+
+func (md *machineDeployment) updateReleaseInBackend(ctx context.Context, status string, metadata *fly.ReleaseMetadata) error {
+	ctx, span := tracing.GetTracer().Start(ctx, "update_release_in_backend", trace.WithAttributes(
+		attribute.String("release_id", md.releaseId),
+		attribute.String("status", status),
+	))
+	defer span.End()
+
+	// Setting a release's status is idempotent, so a transient failure is safe to
+	// retry. Without this, a single blip anywhere between flyctl and api.fly.io
+	// aborts an otherwise healthy deploy after the image has already been built
+	// and pushed -- the user's only recourse being to run the whole deploy again.
+	attempts := 0
+	err := retry.Do(
+		func() error {
+			attempts++
+			_, err := md.uiexClient.UpdateRelease(ctx, md.releaseId, status, metadata)
+
+			return err
+		},
+		retry.Context(ctx),
+		retry.Attempts(releaseStatusRetryAttempts),
+		retry.Delay(releaseStatusRetryDelay),
+		retry.DelayType(retry.BackOffDelay),
+		retry.RetryIf(isRetryableReleaseStatusError),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(n uint, err error) {
+			terminal.Debugf("retrying release status update to %q (attempt %d/%d): %v\n",
+				status, n+2, releaseStatusRetryAttempts, err)
+		}),
+	)
+	span.SetAttributes(attribute.Int("attempts", attempts))
+
+	if err != nil {
+		tracing.RecordError(ctx, span, err, "failed to update machine release")
+
+		return err
+	}
+
+	return nil
+}
+
+// isRetryableReleaseStatusError reports whether a failed release status update is
+// worth another attempt.
+//
+// A *uiex.StatusError means the server did answer, so the status code decides:
+// 5xx is transient, and notably includes the 504 served by the proxy in front of
+// api.fly.io when it gives up waiting on the backend, while 4xx means the request
+// itself is wrong and will fail the same way next time.
+//
+// Any other error -- a connection reset, a TLS handshake failure, a response body
+// that could not be read or decoded -- carries no status code to judge, so we
+// cannot tell a transient fault from a permanent one. Setting a release status is
+// idempotent and the retry budget is small and bounded, so the default is to try
+// again rather than fail a deploy that might well have succeeded. Context
+// cancellation and deadline expiry are the exceptions: both are explicit
+// instructions to stop.
+func isRetryableReleaseStatusError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// The user interrupted us, or a deadline expired. Retrying would ignore that.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var statusErr *uiex.StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.Retryable()
+	}
+
+	return true
+}
+
+func (md *machineDeployment) logClearLinesAbove(count int) {
+	if md.io.IsInteractive() {
+		builder := aec.EmptyBuilder
+		str := builder.Up(uint(count)).EraseLine(aec.EraseModes.All).ANSI
+		fmt.Fprint(md.io.ErrOut, str.String())
+	}
+}
+
+func determineAppConfigForMachines(ctx context.Context, envFromFlags []string, primaryRegion, strategy string, maxUnavailable *float64, files []*fly.File) (*appconfig.Config, error) {
+	appConfig := appconfig.ConfigFromContext(ctx)
+	if appConfig == nil {
+		return nil, fmt.Errorf("BUG: application configuration must come in the context, be sure to pass it before calling NewMachineDeployment")
+	}
+
+	if len(envFromFlags) > 0 {
+		var parsedEnv map[string]string
+		parsedEnv, err := cmdutil.ParseKVStringsToMap(envFromFlags)
+		if err != nil {
+			return nil, fmt.Errorf("failed parsing environment: %w", err)
+		}
+		appConfig.SetEnvVariables(parsedEnv)
+	}
+
+	if strategy != "" {
+		if appConfig.Deploy == nil {
+			appConfig.Deploy = &appconfig.Deploy{}
+		}
+		appConfig.Deploy.Strategy = strategy
+	}
+	if maxUnavailable != nil {
+		if appConfig.Deploy == nil {
+			appConfig.Deploy = &appconfig.Deploy{}
+		}
+		appConfig.Deploy.MaxUnavailable = maxUnavailable
+	}
+
+	// deleting this block will result in machines not being deployed in the user selected region
+	if primaryRegion != "" {
+		appConfig.PrimaryRegion = primaryRegion
+	}
+
+	// Always prefer the app name passed via --app
+	appName := appconfig.NameFromContext(ctx)
+	if appName != "" {
+		appConfig.AppName = appName
+	}
+
+	// Merge in any files passed via --file flags.
+	if err := appConfig.MergeFiles(files); err != nil {
+		return nil, err
+	}
+
+	return appConfig, nil
+}
+
+func (md *machineDeployment) ProcessNames() (names []string) {
+	names = md.appConfig.ProcessNames()
+	if len(md.processGroups) > 0 {
+		names = slices.DeleteFunc(names, func(name string) bool {
+			return !md.processGroups[name]
+		})
+	}
+
+	return
+}
+
+func (md *machineDeployment) ToSpanAttributes() []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attribute.String("deployment.app.name", md.app.Name),
+		attribute.String("deployment.image", md.img),
+		attribute.String("deployment.strategy", md.strategy),
+		attribute.Bool("deployment.skip_smoke_checks", md.skipSmokeChecks),
+		attribute.Bool("deployment.skip_health_checks", md.skipHealthChecks),
+		attribute.Bool("deployment.skip_dns_checks", md.skipDNSChecks),
+		attribute.Bool("deployment.restart_only", md.restartOnly),
+		attribute.Float64("deployment.max_unavailable", md.maxUnavailable),
+		attribute.Float64("deployment.wait_timeout", md.waitTimeout.Seconds()),
+		attribute.Float64("deployment.lease_timeout", md.leaseTimeout.Seconds()),
+		attribute.Float64("deployment.lease_delay_between", md.leaseDelayBetween.Seconds()),
+		attribute.Float64("deployment.release_cmd_timeout", md.releaseCmdTimeout.Seconds()),
+		attribute.Bool("deployment.increased_availability", md.increasedAvailability),
+		attribute.Bool("deployment.update_only", md.updateOnly),
+		attribute.Int("deployment.max_concurrency", md.maxConcurrent),
+		attribute.Int("deployment.volume_initial_size", md.volumeInitialSize),
+	}
+
+	b, err := json.Marshal(md.excludeRegions)
+	if err == nil {
+		attrs = append(attrs, attribute.String("deployment.exclude_regions", string(b)))
+	}
+
+	b, err = json.Marshal(md.onlyRegions)
+	if err == nil {
+		attrs = append(attrs, attribute.String("deployment.only_regions", string(b)))
+	}
+
+	b, err = json.Marshal(md.processGroups)
+	if err == nil {
+		attrs = append(attrs, attribute.String("deployment.process_groups", string(b)))
+	}
+
+	return attrs
+}

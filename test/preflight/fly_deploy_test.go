@@ -1,0 +1,632 @@
+//go:build integration
+// +build integration
+
+package preflight
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	//"github.com/samber/lo"
+	"github.com/containerd/continuity/fs"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/flyctl/test/preflight/testlib"
+)
+
+// useShortLivedDeployToken creates an app-scoped token for a deploy test and
+// makes that token the test environment's active credential. Cleanup revokes
+// the token before restoring the shared preflight credential, so failed tests
+// do not leave long-lived tokens behind. The one-hour expiry is a fallback for
+// process termination or any other situation where testing.Cleanup cannot run.
+func useShortLivedDeployToken(t *testing.T, f *testlib.FlyctlTestEnv) {
+	t.Helper()
+
+	tokenName := fmt.Sprintf("flyctl-preflight-%s", f.ID())
+	tokenResult := f.Fly("tokens deploy --expiry 1h --name %s", tokenName)
+	token := strings.TrimSpace(tokenResult.StdOutString())
+
+	t.Cleanup(func() {
+		f.OverrideAuthAccessToken(token)
+		defer f.ResetAuthAccessToken()
+
+		revokeResult := f.FlyAllowExitFailure("tokens revoke supplied")
+
+		if revokeResult.ExitCode() != 0 {
+			t.Errorf(
+				"failed to revoke preflight deploy token %q: %s",
+				tokenName,
+				revokeResult.StdErrString(),
+			)
+		}
+	})
+
+	f.OverrideAuthAccessToken(token)
+}
+
+func TestFlyDeployHA(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+	if f.SecondaryRegion() == "" {
+		t.Skip()
+	}
+
+	appName := f.CreateRandomAppName()
+
+	f.Fly(
+		"launch --now --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false",
+		f.OrgSlug(), appName, f.PrimaryRegion(),
+	)
+	f.Fly("scale count 1 --region %s --yes", f.SecondaryRegion())
+
+	f.WriteFlyToml(`%s
+[mounts]
+	source = "data"
+	destination = "/data"
+	`, f.ReadFile("fly.toml"))
+
+	x := f.FlyAllowExitFailure("deploy --buildkit --remote-only")
+	require.Contains(f, x.StdErrString(), `needs volumes with name 'data' to fulfill mounts defined in fly.toml`)
+
+	// Create two volumes because fly launch will start 2 machines because of HA setup
+	for _, region := range []string{f.PrimaryRegion(), f.SecondaryRegion()} {
+		var volume *fly.Volume
+		result := f.Fly("volume create -a %s -r %s -s 1 data -y --json", appName, region)
+		result.StdOutJSON(&volume)
+
+		require.Eventually(t, func() bool {
+			return f.FlyAllowExitFailure("volume show %s --app %s --json", volume.ID, appName).ExitCode() == 0
+		}, time.Minute, 2*time.Second, "volume %s never became readable", volume.ID)
+	}
+	f.Fly("deploy --buildkit --remote-only")
+}
+
+// This test overlaps partially in functionality with TestFlyDeployHA, but runs
+// when the test environment uses just a single region
+func TestFlyDeploy_AddNewMount(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+	if f.SecondaryRegion() != "" {
+		t.Skip()
+	}
+
+	appName := f.CreateRandomAppName()
+
+	f.Fly(
+		"launch --now --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false",
+		f.OrgSlug(), appName, f.PrimaryRegion(),
+	)
+
+	f.WriteFlyToml(`%s
+[mounts]
+	source = "data"
+	destination = "/data"
+	`, f.ReadFile("fly.toml"))
+
+	x := f.FlyAllowExitFailure("deploy --buildkit --remote-only")
+	require.Contains(f, x.StdErrString(), `needs volumes with name 'data' to fulfill mounts defined in fly.toml`)
+
+	var volume *fly.Volume
+	result := f.Fly("volume create -a %s -r %s -s 1 data -y --json", appName, f.PrimaryRegion())
+	result.StdOutJSON(&volume)
+	require.Eventually(t, func() bool {
+		return f.FlyAllowExitFailure("volume show %s --app %s --json", volume.ID, appName).ExitCode() == 0
+	}, time.Minute, 2*time.Second, "volume %s never became readable", volume.ID)
+	f.Fly("deploy --buildkit --remote-only")
+}
+
+func TestFlyDeployHAPlacement(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+	appName := f.CreateRandomAppName()
+
+	f.Fly(
+		"launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha",
+		f.OrgSlug(), appName, f.PrimaryRegion(),
+	)
+
+	assertHostDistribution(t, f, appName, 2)
+}
+
+func TestFlyDeploy_DeployToken_Simple(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+	appName := f.CreateRandomAppName()
+	f.Fly("launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false", f.OrgSlug(), appName, f.PrimaryRegion())
+
+	useShortLivedDeployToken(t, f)
+	f.Fly("deploy --buildkit --remote-only")
+}
+
+func TestFlyDeploy_DeployToken_FailingSmokeCheck(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+
+	appName := f.CreateRandomAppName()
+	f.Fly("launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false", f.OrgSlug(), appName, f.PrimaryRegion())
+	appConfig := f.ReadFile("fly.toml")
+	appConfig += `
+[experimental]
+  entrypoint = "/bin/false"
+`
+	f.WriteFlyToml("%s", appConfig)
+
+	useShortLivedDeployToken(t, f)
+	deployRes := f.FlyAllowExitFailure("deploy --buildkit --remote-only")
+	output := deployRes.StdErrString()
+	require.Contains(f, output, "the app appears to be crashing")
+	require.NotContains(f, output, "401 Unauthorized")
+}
+
+func TestFlyDeploy_DeployToken_FailingReleaseCommand(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+
+	appName := f.CreateRandomAppName()
+	f.Fly("launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false", f.OrgSlug(), appName, f.PrimaryRegion())
+	appConfig := f.ReadFile("fly.toml")
+	appConfig += `
+[deploy]
+  release_command = "/bin/false"
+`
+	f.WriteFlyToml("%s", appConfig)
+
+	useShortLivedDeployToken(t, f)
+	deployRes := f.FlyAllowExitFailure("deploy --buildkit --remote-only")
+	output := deployRes.StdErrString()
+	require.Contains(f, output, "exited with non-zero status of 1")
+	require.NotContains(f, output, "401 Unauthorized")
+}
+
+func TestFlyDeploy_Dockerfile(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+	appName := f.CreateRandomAppName()
+	f.WriteFile("Dockerfile", `FROM nginx
+ENV PREFLIGHT_TEST=true`)
+	f.Fly("launch --org %s --name %s --region %s --internal-port 80 --ha=false --now", f.OrgSlug(), appName, f.PrimaryRegion())
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		// Use FlyAllowExitFailure to handle transient WireGuard API failures (HTTP 500)
+		sshResult := f.FlyAllowExitFailure("ssh console -C 'printenv PREFLIGHT_TEST'")
+		if sshResult.ExitCode() != 0 {
+			assert.Fail(c, "ssh command failed, will retry", "exit code: %d, stderr: %s", sshResult.ExitCode(), sshResult.StdErrString())
+			return
+		}
+		assert.Equal(c, "true", strings.TrimSpace(sshResult.StdOutString()), "expected PREFLIGHT_TEST env var to be set in machine")
+	}, 30*time.Second, 2*time.Second)
+}
+
+// TestFlyDeploy_SlowBind_NoFalseListenWarning is the regression test for
+// https://github.com/superfly/flyctl/issues/3358. Apps that take several
+// seconds to bind after boot (Rails/Puma, Node/puppeteer, JVM apps, ...) used
+// to trip flyctl's "The app is not listening on the expected address" warning
+// because the check ran the moment the machine reported "started", before
+// the user's process had a chance to open its listening socket.
+//
+// This test builds an image whose entrypoint sleeps for a few seconds before
+// starting nginx, deploys it without any explicit http_service checks (so the
+// health-check gate returns immediately), and asserts that no false positive
+// warning is emitted while the app is still binding.
+func TestFlyDeploy_SlowBind_NoFalseListenWarning(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+	appName := f.CreateRandomAppName()
+
+	// The sleep is chosen to be well within listenAddressCheckTimeout (15s) so
+	// the polling loop has a chance to observe the bind. It's also long enough
+	// to reliably reproduce the race on machines that would otherwise be fast
+	// enough to hide it.
+	f.WriteFile("Dockerfile", `FROM nginx
+RUN printf '#!/bin/sh\nsleep 8\nexec nginx -g "daemon off;"\n' > /start.sh && chmod +x /start.sh
+CMD ["/start.sh"]
+`)
+
+	// Launch without --now: we want to write a fly.toml with no http_service
+	// checks (matching the issue reporter's config) before the first deploy.
+	f.Fly("launch --org %s --name %s --region %s --internal-port 80 --ha=false --no-deploy", f.OrgSlug(), appName, f.PrimaryRegion())
+
+	f.WriteFlyToml(`app = %q
+primary_region = %q
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 80
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+`, appName, f.PrimaryRegion())
+
+	deployRes := f.Fly("deploy --buildkit --remote-only")
+	output := deployRes.StdErrString() + deployRes.StdOutString()
+
+	require.NotContains(f, output, "not listening on the expected address",
+		"deploy should not emit a false 'not listening' warning for slow-binding apps")
+}
+
+// If this test passes at all, that means that a slow metrics server isn't affecting flyctl
+func TestFlyDeploySlowMetrics(t *testing.T) {
+	env := make(map[string]string)
+	env["FLY_METRICS_BASE_URL"] = "https://flyctl-metrics-slow.fly.dev"
+	env["FLY_SEND_METRICS"] = "1"
+
+	f := testlib.NewTestEnvFromEnvWithEnv(t, env)
+	appName := f.CreateRandomAppName()
+
+	f.Fly(
+		"launch --now --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false",
+		f.OrgSlug(), appName, f.PrimaryRegion(),
+	)
+
+	f.Fly("deploy --buildkit --remote-only")
+}
+
+func getRootPath() string {
+	_, b, _, _ := runtime.Caller(0)
+	return filepath.Dir(b)
+}
+
+func copyFixtureIntoWorkDir(workDir, name string) error {
+	src := fmt.Sprintf("%s/fixtures/%s", getRootPath(), name)
+	return fs.CopyDir(workDir, src)
+}
+
+func TestDeployNodeApp(t *testing.T) {
+	t.Run("With Wireguard", WithParallel(testDeployNodeAppWithRemoteBuilder))
+	// "Without Wireguard" test removed - BuildKit (our standard remote builder) requires
+	// WireGuard to connect to the remote builder app. Testing the legacy remote builder
+	// without WireGuard doesn't align with our BuildKit-first direction.
+	t.Run("With BuildKit", WithParallel(testDeployNodeAppWithBuildKitRemoteBuilder))
+}
+
+func testDeployNodeAppWithRemoteBuilder(tt *testing.T) {
+	t := testLogger{tt}
+	f := testlib.NewTestEnvFromEnv(t)
+	err := copyFixtureIntoWorkDir(f.WorkDir(), "deploy-node")
+	require.NoError(t, err)
+
+	flyTomlPath := fmt.Sprintf("%s/fly.toml", f.WorkDir())
+
+	appName := f.CreateRandomAppMachines()
+	require.NotEmpty(t, appName)
+
+	err = testlib.OverwriteConfig(flyTomlPath, map[string]any{
+		"app":    appName,
+		"region": f.PrimaryRegion(),
+		"env": map[string]string{
+			"TEST_ID": f.ID(),
+		},
+	})
+	require.NoError(t, err)
+
+	t.Logf("deploy %s", appName)
+	f.Fly("deploy --remote-only --ha=false")
+
+	t.Logf("deploy %s again", appName)
+	f.Fly("deploy --remote-only --strategy immediate")
+
+	body, err := testlib.RunHealthCheck(fmt.Sprintf("https://%s.fly.dev", appName))
+	require.NoError(t, err)
+
+	require.Contains(t, string(body), fmt.Sprintf("Hello, World! %s", f.ID()))
+}
+
+func testDeployNodeAppWithBuildKitRemoteBuilder(tt *testing.T) {
+	t := testLogger{tt}
+	f := testlib.NewTestEnvFromEnv(t)
+	err := copyFixtureIntoWorkDir(f.WorkDir(), "deploy-node")
+	require.NoError(t, err)
+
+	flyTomlPath := fmt.Sprintf("%s/fly.toml", f.WorkDir())
+
+	appName := f.CreateRandomAppMachines()
+	require.NotEmpty(t, appName)
+
+	err = testlib.OverwriteConfig(flyTomlPath, map[string]any{
+		"app":    appName,
+		"region": f.PrimaryRegion(),
+		"env": map[string]string{
+			"TEST_ID": f.ID(),
+		},
+	})
+	require.NoError(t, err)
+
+	t.Logf("deploy %s with BuildKit", appName)
+	f.Fly("deploy --buildkit --remote-only --ha=false")
+
+	t.Logf("deploy %s again with BuildKit", appName)
+	f.Fly("deploy --buildkit --remote-only --strategy immediate")
+
+	body, err := testlib.RunHealthCheck(fmt.Sprintf("https://%s.fly.dev", appName))
+	require.NoError(t, err)
+
+	require.Contains(t, string(body), fmt.Sprintf("Hello, World! %s", f.ID()))
+}
+
+func TestFlyDeployBasicNodeWithWGEnabled(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+
+	// Since this pins a specific size, we can skip it for alternate VM sizes.
+	if f.VMSize != "" {
+		t.Skip()
+	}
+
+	err := copyFixtureIntoWorkDir(f.WorkDir(), "deploy-node")
+	require.NoError(t, err)
+
+	flyTomlPath := fmt.Sprintf("%s/fly.toml", f.WorkDir())
+
+	appName := f.CreateRandomAppMachines()
+	require.NotEmpty(t, appName)
+
+	err = testlib.OverwriteConfig(flyTomlPath, map[string]any{
+		"app": appName,
+		"env": map[string]string{
+			"TEST_ID": f.ID(),
+		},
+	})
+	require.NoError(t, err)
+
+	f.Fly("wireguard websockets enable")
+
+	f.Fly("deploy --buildkit --remote-only --ha=false")
+
+	f.Fly("wireguard websockets disable")
+
+	body, err := testlib.RunHealthCheck(fmt.Sprintf("https://%s.fly.dev", appName))
+	require.NoError(t, err)
+
+	require.Contains(t, string(body), fmt.Sprintf("Hello, World! %s", f.ID()))
+}
+
+func TestFlyDeploy_DeployMachinesCheck(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+
+	appName := f.CreateRandomAppName()
+	f.Fly("launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false", f.OrgSlug(), appName, f.PrimaryRegion())
+	appConfig := f.ReadFile("fly.toml")
+	appConfig += `
+		[[http_service.machine_checks]]
+            image = "curlimages/curl"
+   			entrypoint = ["/bin/sh", "-c"]
+			command = ["curl http://[$FLY_TEST_MACHINE_IP]:80"]
+		`
+	f.WriteFlyToml("%s", appConfig)
+
+	useShortLivedDeployToken(t, f)
+	deployRes := f.Fly("deploy --buildkit --remote-only")
+	output := deployRes.StdOutString()
+	require.Contains(f, output, "Test Machine")
+}
+
+func TestFlyDeploy_NoServiceDeployMachinesCheck(t *testing.T) {
+	f := testlib.NewTestEnvFromEnv(t)
+
+	appName := f.CreateRandomAppName()
+	f.Fly("launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false", f.OrgSlug(), appName, f.PrimaryRegion())
+	appConfig := f.ReadFile("fly.toml")
+	appConfig += `
+		[[machine_checks]]
+			image = "curlimages/curl"
+			entrypoint = ["/bin/sh", "-c"]
+			command = ["curl http://[$FLY_TEST_MACHINE_IP]:80"]
+		`
+	f.WriteFlyToml("%s", appConfig)
+
+	useShortLivedDeployToken(t, f)
+	deployRes := f.Fly("deploy --buildkit --remote-only")
+	output := deployRes.StdOutString()
+	require.Contains(f, output, "Test Machine")
+}
+
+// TODO: This test times out after ~15 minutes in CI (hangs at deploy command)
+// The issue appears to be specific to canary strategy + BuildKit + machine checks
+// Similar tests without canary pass fine (TestFlyDeploy_DeployMachinesCheck passes in ~60s)
+// Need to investigate why canary deploys with BuildKit hang indefinitely
+// func TestFlyDeploy_DeployMachinesCheckCanary(t *testing.T) {
+// 	f := testlib.NewTestEnvFromEnv(t)
+//
+// 	appName := f.CreateRandomAppName()
+// 	f.Fly("launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false --strategy canary", f.OrgSlug(), appName, f.PrimaryRegion())
+// 	appConfig := f.ReadFile("fly.toml")
+// 	appConfig += `
+// 		[[http_service.machine_checks]]
+//             image = "curlimages/curl"
+//    			entrypoint = ["/bin/sh", "-c"]
+// 			command = ["curl http://[$FLY_TEST_MACHINE_IP]:80"]
+// 		`
+// 	f.WriteFlyToml("%s", appConfig)
+//
+// 	useShortLivedDeployToken(t, f)
+// 	deployRes := f.Fly("deploy --buildkit --remote-only")
+// 	output := deployRes.StdOutString()
+// 	require.Contains(f, output, "Test Machine")
+// }
+
+// TODO: Commented out due to suspected timeout issues with canary + BuildKit
+// This test uses the same canary strategy that causes TestFlyDeploy_DeployMachinesCheckCanary to hang
+// func TestFlyDeploy_CreateBuilderWDeployToken(t *testing.T) {
+// 	f := testlib.NewTestEnvFromEnv(t)
+//
+// 	appName := f.CreateRandomAppName()
+//
+// 	f.Fly("launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false --strategy canary", f.OrgSlug(), appName, f.PrimaryRegion())
+//
+// 	useShortLivedDeployToken(t, f)
+// 	f.Fly("deploy --buildkit --remote-only")
+// }
+
+func TestDeployManifest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping in short mode: test suite approaches 15m timeout with this test included")
+	}
+
+	f := testlib.NewTestEnvFromEnv(t)
+
+	appName := f.CreateRandomAppName()
+	f.Fly("launch --org %s --name %s --region %s --image nginx:latest --internal-port 80 --ha=false --strategy rolling", f.OrgSlug(), appName, f.PrimaryRegion())
+
+	manifestPath := filepath.Join(f.WorkDir(), "manifest.json")
+
+	f.Fly("deploy --buildkit --remote-only --export-manifest %s", manifestPath)
+
+	manifest := f.ReadFile("manifest.json")
+	require.Contains(t, manifest, `"AppName": "`+appName+`"`)
+	require.Contains(t, manifest, `"primary_region": "`+f.PrimaryRegion()+`"`)
+	require.Contains(t, manifest, `"internal_port": 80`)
+	require.Contains(t, manifest, `"increased_availability": true`)
+	// require.Contains(t, manifest, `"strategy": "rolling"`) FIX: fly launch doesn't set strategy
+	require.Contains(t, manifest, `"image": "nginx:latest"`)
+
+	deployRes := f.Fly("deploy --buildkit --remote-only --from-manifest %s", manifestPath)
+
+	output := deployRes.StdOutString()
+	require.Contains(t, output, fmt.Sprintf("Resuming %s deploy from manifest", appName))
+}
+
+func testDeploy(t *testing.T, appDir string, builderFlag string) {
+	f := testlib.NewTestEnvFromEnv(t)
+	app := f.CreateRandomAppMachines()
+	url := fmt.Sprintf("https://%s.fly.dev", app)
+
+	var result *testlib.FlyctlResult
+	if builderFlag != "" {
+		result = f.Fly("deploy %s --app %s %s", builderFlag, app, appDir)
+	} else {
+		result = f.Fly("deploy --app %s %s", app, appDir)
+	}
+	t.Log(result.StdOutString())
+
+	var resp *http.Response
+	require.Eventually(t, func() bool {
+		var err error
+		resp, err = http.Get(url)
+		return err == nil && resp.StatusCode == http.StatusOK
+	}, 20*time.Second, 1*time.Second, "GET %s never returned 200 OK response 20 seconds", url)
+
+	defer resp.Body.Close()
+	buf, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "Hello World!\n", string(buf))
+}
+
+func TestDeploy(t *testing.T) {
+	t.Run("Buildpack", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("Skipping in short mode: buildpack test is covered by full preflight runs")
+		}
+		t.Parallel()
+		// Buildpacks are built using the pack tool, which requires a Docker API.
+		// Use the CI runner's Docker daemon so this test does not share the
+		// organization's remote builder with the BuildKit test because they are
+		// API-incompatible.
+		testDeploy(t, filepath.Join(testlib.RepositoryRoot(), "test", "preflight", "fixtures", "example-buildpack"), "--local-only")
+	})
+	t.Run("Dockerfile", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("Skipping in short mode: buildkit test is covered by full preflight runs")
+		}
+		t.Parallel()
+		// Explicitly use flyctl's remote BuildKit builder app for the Dockerfile.
+		testDeploy(t, filepath.Join(testlib.RepositoryRoot(), "test", "preflight", "fixtures", "example"), "--buildkit --remote-only")
+	})
+}
+
+// TestFlyDeploy_BlueGreen_StoppedMachines is a regression test for the bug where
+// blue-green deployments silently bypassed health checks when blue machines were
+// stopped (e.g. by auto_stop_machines = "stop" with min_machines_running = 0).
+//
+// Root cause: stopped blue machines had SkipLaunch=true in their launchInput.
+// CreateGreenMachines copied that input without resetting the flag, so green
+// machines were never started. WaitForGreenMachinesToBeHealthy then immediately
+// marked them as "1/1 passing" without ever polling — a silent false success.
+//
+// The fix forces SkipLaunch=false for all green machines and guards health-check
+// polling against vacuously-true AllPassing() on an empty result set.
+func TestFlyDeploy_BlueGreen_StoppedMachines(t *testing.T) {
+	// setupBlueMachinesStopped launches a fresh single-machine app with an
+	// http service health check, does an initial deploy so machines reach
+	// "started", then manually stops every machine to reproduce the
+	// auto_stop_machines trigger condition.
+	setupBlueMachinesStopped := func(t *testing.T) (*testlib.FlyctlTestEnv, string) {
+		t.Helper()
+		f := testlib.NewTestEnvFromEnv(t)
+		appName := f.CreateRandomAppName()
+
+		f.Fly("launch --org %s --name %s --region %s --image nginx --internal-port 80 --ha=false",
+			f.OrgSlug(), appName, f.PrimaryRegion())
+
+		// Add a service health check so bluegreen actually waits for check results.
+		// Without checks the strategy skips health polling, which would make the
+		// failing-app subtest pass vacuously.
+		appConfig := f.ReadFile("fly.toml")
+		appConfig += `
+  [[http_service.checks]]
+    grace_period = "5s"
+    interval = "10s"
+    method = "GET"
+    timeout = "5s"
+    path = "/"
+`
+		f.WriteFlyToml("%s", appConfig)
+		f.Fly("deploy --remote-only")
+
+		// Stop every machine to simulate what auto_stop_machines does between deploys.
+		machines := f.MachinesList(appName)
+		require.NotEmpty(t, machines, "expected at least one machine after initial deploy")
+		for _, m := range machines {
+			f.Fly("machine stop -a %s %s", appName, m.ID)
+		}
+		require.Eventually(t, func() bool {
+			for _, m := range f.MachinesList(appName) {
+				if m.State != fly.MachineStateStopped {
+					return false
+				}
+			}
+			return true
+		}, 30*time.Second, 2*time.Second, "timed out waiting for all machines to reach stopped state")
+
+		return f, appName
+	}
+
+	// A bluegreen deploy of a crashing app must fail, never silently succeed.
+	// Before the fix this exited 0 with "Deployment Complete" while machines
+	// were still stopped and no traffic was served.
+	t.Run("fails when app crashes", func(t *testing.T) {
+		f, _ := setupBlueMachinesStopped(t)
+
+		// Overwrite the entrypoint with /bin/false so the container exits immediately.
+		appConfig := f.ReadFile("fly.toml")
+		appConfig += `
+[experimental]
+  entrypoint = "/bin/false"
+`
+		f.WriteFlyToml("%s", appConfig)
+
+		deployRes := f.FlyAllowExitFailure("deploy --remote-only --strategy bluegreen --wait-timeout 1m")
+		require.NotEqual(t, 0, deployRes.ExitCode(),
+			"bluegreen deploy must fail when the app crashes, not silently report success;\nstdout:\n%s\nstderr:\n%s",
+			deployRes.StdOutString(), deployRes.StdErrString())
+	})
+
+	// A bluegreen deploy of a healthy app must succeed and leave machines running.
+	// Before the fix this also appeared to succeed — but machines stayed stopped
+	// because green machines were never actually started.
+	t.Run("succeeds and machines are started", func(t *testing.T) {
+		f, appName := setupBlueMachinesStopped(t)
+
+		// Re-deploy the same healthy nginx image; no changes, no builder needed.
+		f.Fly("deploy --remote-only --strategy bluegreen")
+
+		// Every machine must be in "started" state — not stopped or created.
+		for _, m := range f.MachinesList(appName) {
+			require.Equal(t, fly.MachineStateStarted, m.State,
+				"machine %s should be 'started' after a successful bluegreen deploy, got '%s'",
+				m.ID, m.State)
+		}
+	})
+}

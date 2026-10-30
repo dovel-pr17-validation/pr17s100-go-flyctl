@@ -1,0 +1,574 @@
+package launch
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"time"
+
+	"github.com/avast/retry-go/v4"
+	"github.com/samber/lo"
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/fly-go/flaps"
+	"github.com/superfly/flyctl/flypg"
+	"github.com/superfly/flyctl/gql"
+	"github.com/superfly/flyctl/internal/appsecrets"
+	extensions_core "github.com/superfly/flyctl/internal/command/extensions/core"
+	"github.com/superfly/flyctl/internal/command/launch/plan"
+	"github.com/superfly/flyctl/internal/command/postgres"
+	"github.com/superfly/flyctl/internal/command/redis"
+	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/internal/mpgutil"
+	"github.com/superfly/flyctl/internal/spinner"
+	mpgv1 "github.com/superfly/flyctl/internal/uiex/mpg/v1"
+	"github.com/superfly/flyctl/internal/uiexutil"
+	"github.com/superfly/flyctl/iostreams"
+)
+
+// createDatabases creates databases requested by the plan
+func (state *launchState) createDatabases(ctx context.Context) error {
+	planStep := plan.GetPlanStep(ctx)
+	// Hints name the app: plan steps stop before fly.toml is written.
+	app := state.Plan.AppName
+	var errs []error
+
+	if state.Plan.Postgres.FlyPostgres != nil && (planStep == "" || planStep == "postgres") {
+		err := state.createFlyPostgres(ctx)
+		if err != nil {
+			// TODO(Ali): Make error printing here better.
+			fmt.Fprintf(iostreams.FromContext(ctx).ErrOut, "Error creating Postgres cluster: %s\n", err)
+			if errors.Is(err, errPostgresAttach) {
+				// The cluster exists; err already carries the exact retry.
+				errs = append(errs, err)
+			} else {
+				errs = append(errs, fmt.Errorf("creating Postgres: %w (to add it later, run `fly postgres attach <cluster> -a %s`; if `fly postgres list` doesn't show a cluster from this launch, run `fly postgres create` first)", err, app))
+			}
+		}
+	}
+
+	if state.Plan.Postgres.ManagedPostgres != nil && (planStep == "" || planStep == "postgres") {
+		err := state.createManagedPostgres(ctx)
+		if err != nil {
+			// TODO(Ali): Make error printing here better.
+			fmt.Fprintf(iostreams.FromContext(ctx).ErrOut, "Error creating Managed Postgres cluster: %s\n", err)
+			errs = append(errs, fmt.Errorf("creating Managed Postgres: %w (to add it later, run `fly mpg attach <cluster> -a %s` for a ready cluster from this launch in `fly mpg list`; if there's none, run `fly mpg create` first, after `fly mpg destroy <cluster> --yes` for one that failed)", err, app))
+		}
+	}
+
+	if state.Plan.Redis.UpstashRedis != nil && (planStep == "" || planStep == "redis") {
+		err := state.createUpstashRedis(ctx)
+		if err != nil {
+			// TODO(Ali): Make error printing here better.
+			fmt.Fprintf(iostreams.FromContext(ctx).ErrOut, "Error provisioning Upstash Redis: %s\n", err)
+			errs = append(errs, fmt.Errorf("provisioning Upstash Redis: %w (to add it later, run `fly secrets set REDIS_URL=<its URL> -a %s`; if `fly redis list` doesn't show a database from this launch, run `fly redis create` first)", err, app))
+		}
+	}
+
+	if state.Plan.ObjectStorage.TigrisObjectStorage != nil && (planStep == "" || planStep == "tigris") {
+		err := state.createTigrisObjectStorage(ctx)
+		if err != nil {
+			// TODO(Ali): Make error printing here better.
+			fmt.Fprintf(iostreams.FromContext(ctx).ErrOut, "Error creating Tigris object storage: %s\n", err)
+			errs = append(errs, fmt.Errorf("creating Tigris object storage: %w (to add it later, run `fly storage create -a %s`; if `fly storage list` shows a bucket from this launch, remove it with `fly storage destroy <bucket> --yes` first)", err, app))
+		}
+	}
+
+	// Run any initialization commands required for Postgres if it was installed
+	if state.Plan.Postgres.Provider() != nil && state.sourceInfo != nil && (planStep == "" || planStep == "postgres") {
+		for _, cmd := range state.sourceInfo.PostgresInitCommands {
+			if cmd.Condition {
+				if err := execInitCommand(ctx, cmd); err != nil {
+					// Keep the provider errors and their recovery steps.
+					return errors.Join(append(errs, err)...)
+				}
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func (state *launchState) createFlyPostgres(ctx context.Context) error {
+	var (
+		pgPlan = state.Plan.Postgres.FlyPostgres
+		io     = iostreams.FromContext(ctx)
+	)
+
+	attachToExisting := false
+
+	if pgPlan.AppName == "" {
+		pgPlan.AppName = fmt.Sprintf("%s-db", state.appConfig.AppName)
+	}
+
+	if _, err := flapsutil.ClientFromContext(ctx).GetApp(ctx, pgPlan.AppName); err == nil {
+		attachToExisting = true
+	}
+
+	if attachToExisting {
+		// If we try to attach to a PG cluster with the usual username
+		// format, we'll get an error (since that username already exists)
+		// by generating a new username with a sufficiently random number
+		// (in this case, the nanon second that the database is being attached)
+		dbUser := newPostgresUser(pgPlan.AppName)
+
+		err := postgres.AttachCluster(ctx, postgres.AttachParams{
+			PgAppName: pgPlan.AppName,
+			AppName:   state.Plan.AppName,
+			DbUser:    dbUser,
+			Force:     flag.GetYes(ctx),
+		})
+
+		if err != nil {
+			fmt.Fprintf(io.Out, "Failed attaching %s to the Postgres cluster %s: %s\n", state.Plan.AppName, pgPlan.AppName, err)
+
+			return attachFailed(err, postgresAttachRetry(pgPlan.AppName, state.Plan.AppName))
+		} else {
+			fmt.Fprintf(io.Out, "Postgres cluster %s is now attached to %s\n", pgPlan.AppName, state.Plan.AppName)
+		}
+	} else {
+		// Create new PG cluster
+		org, err := state.Org(ctx)
+		if err != nil {
+			return err
+		}
+		region, err := state.Region(ctx)
+		if err != nil {
+			return err
+		}
+		err = postgres.CreateCluster(ctx, org, &region, &postgres.ClusterParams{
+			PostgresConfiguration: postgres.PostgresConfiguration{
+				Name:               pgPlan.AppName,
+				DiskGb:             pgPlan.DiskSizeGB,
+				InitialClusterSize: pgPlan.Nodes,
+				VMSize:             pgPlan.VmSize,
+				MemoryMb:           pgPlan.VmRam,
+			},
+			ScaleToZero: &pgPlan.AutoStop,
+			Autostart:   true, // TODO(Ali): Do we want this?
+			Manager:     flypg.ReplicationManager,
+		})
+		if err != nil {
+			fmt.Fprintf(io.Out, "Failed creating the Postgres cluster %s: %s\n", pgPlan.AppName, err)
+		} else {
+			err = postgres.AttachCluster(ctx, postgres.AttachParams{
+				PgAppName: pgPlan.AppName,
+				AppName:   state.Plan.AppName,
+				SuperUser: true,
+			})
+
+			if err != nil {
+				fmt.Fprintf(io.Out, "Failed attaching %s to the Postgres cluster %s: %s\n", state.Plan.AppName, pgPlan.AppName, err)
+				err = attachFailed(err, postgresAttachRetry(pgPlan.AppName, state.Plan.AppName))
+			} else {
+				fmt.Fprintf(io.Out, "Postgres cluster %s is now attached to %s\n", pgPlan.AppName, state.Plan.AppName)
+			}
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func (state *launchState) createManagedPostgres(ctx context.Context) error {
+	var (
+		io          = iostreams.FromContext(ctx)
+		pgPlan      = state.Plan.Postgres.ManagedPostgres
+		flapsClient = flapsutil.ClientFromContext(ctx)
+	)
+
+	// Check if we should attach to an existing cluster instead of creating a new one
+	if pgPlan.ClusterID != "" {
+		return state.attachToManagedPostgres(ctx, pgPlan.ClusterID)
+	}
+
+	// InitClient puts a client in the context, so this only trips in tests.
+	if flapsClient == nil {
+		return fmt.Errorf("flaps client not found in context")
+	}
+
+	// Get org
+	org, err := state.Org(ctx)
+	if err != nil {
+		return err
+	}
+
+	// For ui-ex request we need the real org slug
+	slug := org.Slug
+	if org.Slug == "personal" {
+		slug = org.RawSlug
+	}
+
+	// Create the cluster with retry logic for network errors.
+	input := flaps.CreateManagedPostgresClusterRequest{
+		OrgSlug:        slug,
+		Name:           pgPlan.DbName,
+		Region:         pgPlan.Region,
+		Plan:           pgPlan.Plan,
+		DiskSizeGB:     pgPlan.DiskSize,
+		PGMajorVersion: mpgutil.DefaultPGMajorVersion,
+	}
+
+	fmt.Fprintf(io.Out, "Provisioning Managed Postgres cluster...\n")
+
+	var cluster flaps.ManagedPostgresCluster
+	err = retry.Do(
+		func() error {
+			var retryErr error
+			cluster, retryErr = flapsClient.CreateManagedPostgresCluster(ctx, input)
+
+			return retryErr
+		},
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.Delay(1*time.Second),
+		retry.DelayType(retry.BackOffDelay),
+		retry.OnRetry(func(n uint, err error) {
+			fmt.Fprintf(io.Out, "Retrying cluster creation (attempt %d) due to: %v\n", n+1, err)
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed creating managed postgres cluster: %w", err)
+	}
+
+	clusterID := cluster.ID
+
+	// Wait for cluster to be ready
+	colorize := io.ColorScheme()
+	fmt.Fprintf(io.Out, "%s\n", colorize.Bold(fmt.Sprintf("Waiting for cluster %s (%s) to be ready...", pgPlan.DbName, clusterID)))
+	fmt.Fprintf(io.Out, "\n%s\n", colorize.Bold("This'll take a few minutes, but you don't have to wait around if you don't want to!"))
+	fmt.Fprintf(io.Out, "To connect your Managed Postgres cluster later just:\n")
+	fmt.Fprintf(io.Out, "  - Press %s to continue with deployment\n", colorize.Purple("Ctrl+C"))
+	fmt.Fprintf(io.Out, "  - Use %s to confirm that your MPG cluster is ready\n", colorize.Purple("fly mpg status"))
+	fmt.Fprintf(io.Out, "  - Use %s to attach to your app\n", colorize.Purple("fly mpg attach"))
+
+	// Start spinner to show progress
+	s := spinner.Run(io, colorize.Yellow("Provisioning your Managed Postgres cluster..."))
+
+	// Create a separate context for the wait loop with 15 minute timeout
+	waitCtx, cancel := context.WithTimeoutCause(ctx, 15*time.Minute, fmt.Errorf("waiting for managed Postgres creation: %w", context.DeadlineExceeded))
+	defer cancel()
+
+	// Poll until the cluster is ready, capturing it for its endpoints, with a
+	// 15-minute timeout and exponential backoff.
+	var readyCluster flaps.ManagedPostgresCluster
+	err = retry.Do(
+		func() error {
+			current, err := flapsClient.GetManagedPostgresCluster(waitCtx, clusterID)
+			if err != nil {
+				// For network errors, return the error to trigger retry
+				if containsNetworkError(err.Error()) {
+					return err
+				}
+				// For other errors, make them unrecoverable
+				return retry.Unrecoverable(fmt.Errorf("failed checking cluster status: %w", err))
+			}
+
+			switch current.Status {
+			case flaps.ManagedPostgresStatusReady:
+				readyCluster = current
+
+				return nil // Success!
+			case flaps.ManagedPostgresStatusFailed, flaps.ManagedPostgresStatusError:
+				return retry.Unrecoverable(fmt.Errorf("cluster creation failed"))
+			default:
+				// Return an error to continue retrying if status is not ready
+				return fmt.Errorf("cluster status is %s, waiting for ready", current.Status)
+			}
+		},
+		retry.Context(waitCtx),
+		retry.Attempts(0), // Unlimited attempts within the timeout
+		retry.Delay(2*time.Second),
+		retry.MaxDelay(30*time.Second),
+		retry.DelayType(retry.BackOffDelay),
+		retry.OnRetry(func(n uint, err error) {
+			// Log network-related errors and periodic status updates
+			if containsNetworkError(err.Error()) {
+				s.Stop()
+				fmt.Fprintf(io.Out, "Retrying status check due to network issue: %v\n", err)
+				s = spinner.Run(io, colorize.Yellow("Provisioning your Managed Postgres cluster..."))
+			} else if n%10 == 0 && n > 0 { // Log every 10th attempt to show progress
+				s.Stop()
+				fmt.Fprintf(io.Out, "Still waiting for cluster to be ready (attempt %d)...\n", n+1)
+				s = spinner.Run(io, colorize.Yellow("Provisioning your Managed Postgres cluster..."))
+			}
+		}),
+	)
+
+	// Stop the spinner
+	s.Stop()
+
+	// Handle the result
+	if err != nil {
+		// Check if we hit the timeout
+		if waitCtx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(io.Out, "\nCluster creation is taking longer than expected. Continuing with deployment.\n")
+			fmt.Fprintf(io.Out, "You can check the status later with 'fly mpg status' and attach with 'fly mpg attach'.\n")
+
+			return nil
+		}
+		// Check if the user cancelled
+		if ctx.Err() == context.Canceled {
+			fmt.Fprintf(io.Out, "\nContinuing with deployment. You can check the status later with 'fly mpg status' and attach with 'fly mpg attach'.\n")
+
+			return nil
+		}
+
+		return err
+	}
+
+	// Fetch the default user's credentials with retry logic, then build
+	// DATABASE_URL from the ready cluster's pooler endpoint.
+	var creds flaps.ManagedPostgresUserCredentials
+	err = retry.Do(
+		func() error {
+			var retryErr error
+			creds, retryErr = flapsClient.GetManagedPostgresUserCredentials(ctx, clusterID, mpgutil.DefaultUsername)
+
+			return retryErr
+		},
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.Delay(1*time.Second),
+		retry.DelayType(retry.BackOffDelay),
+		retry.OnRetry(func(n uint, err error) {
+			fmt.Fprintf(io.Out, "Retrying credential retrieval (attempt %d) due to: %v\n", n+1, err)
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed retrieving cluster credentials: %w", err)
+	}
+
+	connectionURI := mpgutil.ConnectionURI(readyCluster, creds.Password)
+
+	// Set the connection string as a secret
+	secrets := map[string]string{
+		"DATABASE_URL": connectionURI,
+	}
+
+	if err := appsecrets.Update(ctx, flapsClient, state.Plan.AppName, secrets, nil); err != nil {
+		return fmt.Errorf("failed setting database secrets: %w", err)
+	}
+
+	fmt.Fprintf(io.Out, "\n%s\n", colorize.Bold(colorize.Green(fmt.Sprintf("Managed Postgres cluster %s is ready and attached to %s", clusterID, state.Plan.AppName))))
+	fmt.Fprintf(io.Out, "The following secret was added to %s:\n  DATABASE_URL=%s\n", state.Plan.AppName, connectionURI)
+
+	return nil
+}
+
+// attachToManagedPostgres attaches an existing Managed Postgres cluster to the app
+func (state *launchState) attachToManagedPostgres(ctx context.Context, clusterID string) error {
+	var (
+		io        = iostreams.FromContext(ctx)
+		mpgClient = mpgv1.ClientFromContext(ctx)
+	)
+
+	// Get cluster details to verify it exists and get credentials
+	fmt.Fprintf(io.Out, "Attaching to existing Managed Postgres cluster %s...\n", clusterID)
+
+	var cluster mpgv1.GetManagedClusterResponse
+	err := retry.Do(
+		func() error {
+			var retryErr error
+			cluster, retryErr = mpgClient.GetManagedClusterById(ctx, clusterID)
+
+			return retryErr
+		},
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.Delay(1*time.Second),
+		retry.DelayType(retry.BackOffDelay),
+		retry.OnRetry(func(n uint, err error) {
+			fmt.Fprintf(io.Out, "Retrying cluster lookup (attempt %d) due to: %v\n", n+1, err)
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed retrieving cluster %s: %w", clusterID, err)
+	}
+
+	// Verify the cluster and app are in the same organization
+	app, err := flapsutil.ClientFromContext(ctx).GetApp(ctx, state.Plan.AppName)
+	if err != nil {
+		return fmt.Errorf("failed retrieving app %s: %w", state.Plan.AppName, err)
+	}
+
+	appOrg, err := uiexutil.ClientFromContext(ctx).GetOrganization(ctx, app.Organization.Slug)
+	if err != nil {
+		return fmt.Errorf("failed retrieving organization for app %s: %w", state.Plan.AppName, err)
+	}
+
+	clusterOrgSlug := cluster.Data.Organization.Slug
+	appOrgSlug := appOrg.RawSlug
+
+	if appOrgSlug != clusterOrgSlug {
+		return fmt.Errorf("app %s is in organization %s, but cluster %s is in organization %s. They must be in the same organization to attach",
+			state.Plan.AppName, appOrgSlug, clusterID, clusterOrgSlug)
+	}
+
+	// Build connection URI with the database name from the plan (if provided)
+	connectionUri := cluster.Credentials.ConnectionUri
+	dbName := state.Plan.Postgres.ManagedPostgres.DbName
+	if dbName != "" {
+		// Parse the base connection URI and replace the database name
+		parsedUri, err := url.Parse(cluster.Credentials.ConnectionUri)
+		if err != nil {
+			return fmt.Errorf("failed to parse connection URI: %w", err)
+		}
+		parsedUri.Path = "/" + dbName
+		connectionUri = parsedUri.String()
+	}
+
+	// Set the connection string as a secret
+	secrets := map[string]string{
+		"DATABASE_URL": connectionUri,
+	}
+
+	flapsClient := flapsutil.ClientFromContext(ctx)
+	if err := appsecrets.Update(ctx, flapsClient, state.Plan.AppName, secrets, nil); err != nil {
+		return fmt.Errorf("failed setting database secrets: %w", err)
+	}
+
+	fmt.Fprintf(io.Out, "Managed Postgres cluster %s is now attached to %s\n", clusterID, state.Plan.AppName)
+	fmt.Fprintf(io.Out, "The following secret was added to %s:\n  DATABASE_URL=%s\n", state.Plan.AppName, connectionUri)
+
+	return nil
+}
+
+// containsNetworkError checks if an error message contains network-related error indicators
+func containsNetworkError(errMsg string) bool {
+	networkErrors := []string{
+		"connection reset by peer",
+		"connection refused",
+		"timeout",
+		"network is unreachable",
+		"temporary failure in name resolution",
+		"i/o timeout",
+	}
+
+	for _, netErr := range networkErrors {
+		if contains(errMsg, netErr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// contains checks if a string contains a substring (case-insensitive)
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) &&
+		(s == substr ||
+			len(s) > len(substr) &&
+				(stringContains(s, substr)))
+}
+
+func stringContains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (state *launchState) createUpstashRedis(ctx context.Context) error {
+	redisPlan := state.Plan.Redis.UpstashRedis
+	dbName := fmt.Sprintf("%s-redis", state.Plan.AppName)
+	org, err := state.Org(ctx)
+	if err != nil {
+		return err
+	}
+	region, err := state.Region(ctx)
+	if err != nil {
+		return err
+	}
+
+	var readReplicaRegions []fly.Region
+	{
+		flapsClient := flapsutil.ClientFromContext(ctx)
+		regionData, err := flapsClient.GetRegions(ctx)
+		if err != nil {
+			return err
+		}
+		regions := regionData.Regions
+		// Filter out deprecated regions
+		regions = lo.Filter(regions, func(r fly.Region, _ int) bool {
+			return !r.Deprecated
+		})
+		for _, code := range redisPlan.ReadReplicas {
+			if region, ok := lo.Find(regions, func(r fly.Region) bool { return r.Code == code }); ok {
+				readReplicaRegions = append(readReplicaRegions, region)
+			} else {
+				return fmt.Errorf("region %s not found", code)
+			}
+		}
+	}
+
+	// Get the default plan (pay-as-you-go)
+	plan, err := redis.DeterminePlan(ctx, "")
+	if err != nil {
+		return err
+	}
+
+	// Launch uses defaults: no auto-upgrade (not available for pay-as-you-go anyway), no prodpack
+	db, err := redis.Create(ctx, org, dbName, &region, plan, len(readReplicaRegions) == 0, redisPlan.Eviction, false, false, &readReplicaRegions)
+	if err != nil {
+		return err
+	}
+
+	return redis.AttachDatabase(ctx, db, state.Plan.AppName)
+}
+
+func (state *launchState) createTigrisObjectStorage(ctx context.Context) error {
+	tigrisPlan := state.Plan.ObjectStorage.TigrisObjectStorage
+
+	org, err := state.Org(ctx)
+	if err != nil {
+		return err
+	}
+
+	params := extensions_core.ExtensionParams{
+		Provider:       "tigris",
+		Organization:   org,
+		AppName:        state.Plan.AppName,
+		OverrideName:   new(tigrisPlan.Name),
+		OverrideRegion: state.Plan.RegionCode,
+		Options: gql.AddOnOptions{
+			"public":     tigrisPlan.Public,
+			"accelerate": tigrisPlan.Accelerate,
+			"website": map[string]any{
+				"domain_name": tigrisPlan.WebsiteDomainName,
+			},
+		},
+		OverrideExtensionSecretKeyNames: state.sourceInfo.OverrideExtensionSecretKeyNames,
+	}
+
+	_, err = extensions_core.ProvisionExtension(ctx, params)
+
+	if err != nil {
+		return err
+	}
+
+	return err
+}
+
+// errPostgresAttach marks a Postgres cluster that exists but isn't attached.
+var errPostgresAttach = errors.New("attaching Postgres failed")
+
+func attachFailed(err error, retry string) error {
+	return fmt.Errorf("%w: %w (to retry, run `%s`)", errPostgresAttach, err, retry)
+}
+
+// postgresAttachRetry retries an attach that may have stopped halfway: the
+// app's database can exist (--yes) and so can its default user (a new one).
+func postgresAttachRetry(pgApp, app string) string {
+	return fmt.Sprintf("fly postgres attach --app %s %s --database-user %s --yes", app, pgApp, newPostgresUser(pgApp))
+}
+
+// newPostgresUser is unique enough not to collide with an existing user.
+func newPostgresUser(pgApp string) string {
+	return fmt.Sprintf("%s-%d", pgApp, time.Now().Nanosecond())
+}

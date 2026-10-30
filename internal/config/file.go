@@ -1,0 +1,194 @@
+package config
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"maps"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/superfly/flyctl/wg"
+	"gopkg.in/yaml.v3"
+
+	"github.com/superfly/flyctl/flyctl"
+	"github.com/superfly/flyctl/helpers"
+	"github.com/superfly/flyctl/internal/filemu"
+)
+
+func ReadAccessToken(path string) (string, error) {
+	s := struct {
+		AccessToken string `yaml:"access_token"`
+	}{}
+	if err := unmarshal(path, &s); err != nil {
+		return "", err
+	}
+
+	return s.AccessToken, nil
+}
+
+// SetAccessToken sets the value of the access token at the configuration file
+// found at path.
+func SetAccessToken(path, token string) error {
+	return set(path, map[string]any{
+		AccessTokenFileKey: token,
+	})
+}
+
+// SetLastLogin sets the last login timestamp at the configuration file
+// found at path.
+func SetLastLogin(path string, timestamp time.Time) error {
+	return set(path, map[string]any{
+		LastLoginFileKey: timestamp,
+	})
+}
+
+// SetMetricsToken sets the value of the metrics token at the configuration file
+// found at path.
+func SetMetricsToken(path, token string) error {
+	return set(path, map[string]any{
+		MetricsTokenFileKey: token,
+	})
+}
+
+// SetSendMetrics sets the value of the send metrics flag at the configuration file
+// found at path.
+func SetSendMetrics(path string, sendMetrics bool) error {
+	return set(path, map[string]any{
+		SendMetricsFileKey: sendMetrics,
+	})
+}
+
+// SetSyntheticsAgent sets the value of the synthetics agent flag at the configuration file
+// found at path.
+func SetSyntheticsAgent(path string, syntheticsAgent bool) error {
+	return set(path, map[string]any{
+		SyntheticsAgentFileKey: syntheticsAgent,
+	})
+}
+
+// SetAutoUpdate sets the value of the autoupdate flag at the configuration file
+// found at path.
+func SetAutoUpdate(path string, autoUpdate bool) error {
+	return set(path, map[string]any{
+		AutoUpdateFileKey: autoUpdate,
+	})
+}
+
+func SetWireGuardState(path string, state wg.States) error {
+	return set(path, map[string]any{
+		WireGuardStateFileKey: state,
+	})
+}
+
+func SetWireGuardWebsocketsEnabled(path string, enabled bool) error {
+	return set(path, map[string]any{
+		WireGuardWebsocketsFileKey: enabled,
+	})
+}
+
+func SetWireGuardTokenModeEnabled(path string, enabled bool) error {
+	return set(path, map[string]any{
+		WireGuardTokenModeFileKey: enabled,
+	})
+}
+
+type AppSecretsMinvers map[string]uint64
+
+func SetAppSecretsMinvers(path string, minvers AppSecretsMinvers) error {
+	return set(path, map[string]any{
+		AppSecretsMinverFileKey: minvers,
+	})
+}
+
+// Clear clears the access token, metrics token, last login timestamp, and wireguard-related keys of the configuration
+// file found at path.
+func Clear(path string) (err error) {
+	return set(path, map[string]any{
+		AccessTokenFileKey:      "",
+		MetricsTokenFileKey:     "",
+		LastLoginFileKey:        time.Time{}, // Zero value for time.Time
+		WireGuardStateFileKey:   map[string]any{},
+		AppSecretsMinverFileKey: AppSecretsMinvers{},
+	})
+}
+
+func set(path string, vals map[string]any) error {
+	m := make(map[string]any)
+
+	switch err := unmarshal(path, &m); {
+	case err == nil, os.IsNotExist(err):
+		break
+	default:
+		return err
+	}
+
+	maps.Copy(m, vals)
+
+	return marshal(path, m)
+}
+
+func lockPath() string {
+	return filepath.Join(flyctl.ConfigDir(), "flyctl.config.lock")
+}
+
+func unmarshal(path string, v any) (err error) {
+	var unlock filemu.UnlockFunc
+	if unlock, err = filemu.RLock(context.Background(), lockPath()); err != nil {
+		return
+	}
+	defer func() {
+		if e := unlock(); err == nil {
+			err = e
+		}
+	}()
+
+	err = unmarshalUnlocked(path, v)
+
+	return
+}
+
+func unmarshalUnlocked(path string, v any) (err error) {
+	var f *os.File
+	if f, err = os.Open(path); err != nil {
+		return
+	}
+	defer func() {
+		if e := f.Close(); err == nil {
+			err = e
+		}
+	}()
+
+	err = yaml.NewDecoder(f).Decode(v)
+	if err == io.EOF {
+		err = nil
+	}
+
+	return
+}
+
+func marshal(path string, v any) (err error) {
+	var unlock filemu.UnlockFunc
+	if unlock, err = filemu.Lock(context.Background(), lockPath()); err != nil {
+		return
+	}
+	defer func() {
+		if e := unlock(); err == nil {
+			err = e
+		}
+	}()
+
+	err = marshalUnlocked(path, v)
+
+	return
+}
+
+func marshalUnlocked(path string, v any) (err error) {
+	var b bytes.Buffer
+	if err = yaml.NewEncoder(&b).Encode(v); err != nil {
+		return err
+	}
+
+	return helpers.WriteFileAtomically(path, b.Bytes(), 0o600)
+}

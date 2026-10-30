@@ -1,0 +1,336 @@
+package imgsrc
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/fly-go/flaps"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/internal/flyutil"
+	"github.com/superfly/flyctl/internal/mock"
+	"github.com/superfly/flyctl/internal/state"
+	"github.com/superfly/flyctl/internal/uiex"
+	"go.uber.org/mock/gomock"
+)
+
+//go:generate go run go.uber.org/mock/mockgen -package imgsrc -destination flaps_mock_test.go github.com/superfly/flyctl/internal/flapsutil FlapsClient
+
+func testingContext(t *testing.T) context.Context {
+	ctx := context.Background()
+	ctx = state.WithConfigDirectory(ctx, t.TempDir())
+
+	return ctx
+}
+
+func TestValidateBuilder(t *testing.T) {
+	ctx := testingContext(t)
+	p := NewProvisionerUiexOrg(&uiex.Organization{})
+
+	hasVolumes := false
+	hasMachines := false
+	flapsClient := mock.FlapsClient{
+		GetVolumesFunc: func(ctx context.Context, appName string) ([]fly.Volume, error) {
+			if hasVolumes {
+				return []fly.Volume{{
+					ID: "bigvolume",
+				}}, nil
+			} else {
+				return []fly.Volume{}, nil
+			}
+		},
+		ListFunc: func(ctx context.Context, appName, state string) ([]*fly.Machine, error) {
+			if hasMachines {
+				return []*fly.Machine{{
+					ID:    "bigmachine",
+					State: "started",
+				}}, nil
+			} else {
+				return []*fly.Machine{}, nil
+			}
+		},
+	}
+	ctx = flapsutil.NewContextWithClient(ctx, &flapsClient)
+
+	_, err := p.validateBuilder(ctx, nil)
+	assert.EqualError(t, err, NoBuilderApp.Error())
+
+	_, err = p.validateBuilder(ctx, &flaps.App{})
+	assert.EqualError(t, err, NoBuilderVolume.Error())
+
+	hasVolumes = true
+	_, err = p.validateBuilder(ctx, &flaps.App{})
+	assert.EqualError(t, err, InvalidMachineCount.Error())
+
+	hasMachines = true
+	_, err = p.validateBuilder(ctx, &flaps.App{})
+	assert.NoError(t, err)
+}
+
+func TestValidateBuilderAPIErrors(t *testing.T) {
+	ctx := testingContext(t)
+	p := NewProvisionerUiexOrg(&uiex.Organization{})
+
+	maxVolumeRetries := 3
+	volumeRetries := 0
+	volumesShouldFail := false
+
+	maxMachineRetries := 3
+	machineRetries := 0
+	machinesShouldFail := false
+
+	responseStatusCode := 500
+
+	flapsClient := mock.FlapsClient{
+		GetVolumesFunc: func(ctx context.Context, appName string) ([]fly.Volume, error) {
+			if volumesShouldFail {
+				volumeRetries += 1
+
+				if volumeRetries < maxVolumeRetries {
+					return nil, &flaps.FlapsError{
+						ResponseStatusCode: responseStatusCode,
+						ResponseBody:       []byte("internal server error"),
+					}
+				}
+			}
+
+			return []fly.Volume{{
+				ID: "bigvolume",
+			}}, nil
+
+		},
+		ListFunc: func(ctx context.Context, appName, state string) ([]*fly.Machine, error) {
+			if machinesShouldFail {
+				machineRetries += 1
+
+				if machineRetries < maxMachineRetries {
+					return nil, &flaps.FlapsError{
+						ResponseStatusCode: responseStatusCode,
+						ResponseBody:       []byte("internal server error"),
+					}
+				}
+			}
+
+			return []*fly.Machine{{
+				ID:    "bigmachine",
+				State: "started",
+			}}, nil
+		},
+	}
+	ctx = flapsutil.NewContextWithClient(ctx, &flapsClient)
+
+	volumesShouldFail = true
+	_, err := p.validateBuilder(ctx, &flaps.App{})
+	assert.NoError(t, err)
+
+	volumeRetries = 0
+	maxVolumeRetries = 7
+	_, err = p.validateBuilder(ctx, &flaps.App{})
+	assert.Error(t, err)
+
+	volumeRetries = 0
+	responseStatusCode = 404
+	// we should only try once if the error is not a server error
+	_, err = p.validateBuilder(ctx, &flaps.App{})
+	var flapsErr *flaps.FlapsError
+	assert.True(t, errors.As(err, &flapsErr))
+	assert.Equal(t, 404, flapsErr.ResponseStatusCode)
+	assert.Equal(t, 1, volumeRetries)
+
+	volumesShouldFail = false
+	machinesShouldFail = true
+	responseStatusCode = 500
+	_, err = p.validateBuilder(ctx, &flaps.App{})
+	assert.NoError(t, err)
+
+	machineRetries = 0
+	maxMachineRetries = 7
+	_, err = p.validateBuilder(ctx, &flaps.App{})
+	assert.Error(t, err)
+
+	machineRetries = 0
+	responseStatusCode = 404
+	// we should only try once if the error is not a server error
+	_, err = p.validateBuilder(ctx, &flaps.App{})
+	assert.True(t, errors.As(err, &flapsErr))
+	assert.Equal(t, 404, flapsErr.ResponseStatusCode)
+	assert.Equal(t, 1, machineRetries)
+}
+
+func TestValidateBuilderNotStarted(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	client := NewMockFlapsClient(ctrl)
+
+	ctx := testingContext(t)
+	ctx = flapsutil.NewContextWithClient(ctx, client)
+
+	provisioner := NewProvisionerUiexOrg(&uiex.Organization{})
+	provisioner.useVolume = false
+
+	client.EXPECT().List(gomock.Any(), gomock.Eq(""), gomock.Any()).Return([]*fly.Machine{
+		{State: "stopped"},
+	}, nil)
+	machine, err := provisioner.validateBuilder(ctx, &flaps.App{})
+	assert.ErrorIs(t, err, BuilderMachineNotStarted)
+	assert.NotNil(t, machine, "Go functions usually return either a value or an error, but this is not")
+}
+
+func TestCreateBuilder(t *testing.T) {
+	ctx := testingContext(t)
+	org := &uiex.Organization{
+		Slug: "bigorg",
+	}
+	p := NewProvisionerUiexOrg(org)
+
+	createAppShouldFail := false
+	allocateIPAddressShouldFail := false
+	apiClient := mock.Client{}
+
+	waitForAppShouldFail := false
+	launchShouldFail := false
+
+	createVolumeShouldFail := false
+	maxCreateVolumeAttempts := 3
+	createVolumeAttempts := 0
+
+	flapsClient := mock.FlapsClient{
+		CreateAppFunc: func(ctx context.Context, req flaps.CreateAppRequest) (*flaps.App, error) {
+			if createAppShouldFail {
+				return nil, errors.New("create app failed")
+			}
+
+			return &flaps.App{
+				Name: req.Name,
+			}, nil
+		},
+		AssignIPFunc: func(ctx context.Context, appName string, req flaps.AssignIPRequest) (*flaps.AssignIPResponse, error) {
+			if allocateIPAddressShouldFail {
+				return nil, errors.New("allocate ip address failed")
+			}
+
+			return &flaps.AssignIPResponse{}, nil
+		},
+		WaitForAppFunc: func(ctx context.Context, name string) error {
+			if waitForAppShouldFail {
+				return errors.New("wait for app failed")
+			}
+
+			return nil
+		},
+		CreateVolumeFunc: func(ctx context.Context, appName string, req fly.CreateVolumeRequest) (*fly.Volume, error) {
+			if createVolumeShouldFail {
+				createVolumeAttempts += 1
+
+				if createVolumeAttempts < maxCreateVolumeAttempts {
+					return nil, &flaps.FlapsError{
+						ResponseStatusCode: 500,
+						ResponseBody:       []byte("internal server error"),
+					}
+				}
+			}
+
+			return &fly.Volume{
+				ID: "bigvolume",
+			}, nil
+		},
+		DeleteVolumeFunc: func(ctx context.Context, appName, volumeId string) (*fly.Volume, error) {
+			return nil, nil
+		},
+		LaunchFunc: func(ctx context.Context, appName string, input fly.LaunchMachineInput) (*fly.Machine, error) {
+			if launchShouldFail {
+				return nil, errors.New("launch machine failed")
+			}
+
+			return &fly.Machine{
+				ID:    "bigmachine",
+				State: "started",
+			}, nil
+		},
+		WaitFunc: func(ctx context.Context, appName string, machineID string, waitOpts ...flaps.WaitOption) (err error) {
+			time.Sleep(1 * time.Second)
+
+			return nil
+		},
+	}
+	ctx = flyutil.NewContextWithClient(ctx, &apiClient)
+	ctx = flapsutil.NewContextWithClient(ctx, &flapsClient)
+
+	app, machine, err := p.createBuilder(ctx, "ord", "builder")
+	assert.NoError(t, err)
+	assert.Equal(t, "bigmachine", machine.ID)
+	assert.Equal(t, app.Name, "builder")
+
+	createAppShouldFail = true
+	_, _, err = p.createBuilder(ctx, "ord", "builder")
+	assert.Error(t, err)
+
+	createAppShouldFail = false
+	allocateIPAddressShouldFail = true
+	_, _, err = p.createBuilder(ctx, "ord", "builder")
+	assert.Error(t, err)
+
+	allocateIPAddressShouldFail = false
+	waitForAppShouldFail = true
+	_, _, err = p.createBuilder(ctx, "ord", "builder")
+	assert.Error(t, err)
+
+	waitForAppShouldFail = false
+	createVolumeShouldFail = true
+	_, _, err = p.createBuilder(ctx, "ord", "builder")
+	assert.NoError(t, err)
+
+	createVolumeAttempts = 0
+	maxCreateVolumeAttempts = 7
+	_, _, err = p.createBuilder(ctx, "ord", "builder")
+	assert.Error(t, err)
+
+	createVolumeShouldFail = false
+	launchShouldFail = true
+	_, _, err = p.createBuilder(ctx, "ord", "builder")
+	assert.Error(t, err)
+}
+
+func TestStartOrRestartBuilderMachine(t *testing.T) {
+	t.Parallel()
+	ctx := testingContext(t)
+
+	couldNotReserveResources := false
+	started := false
+	flapsClient := mock.FlapsClient{
+		StartFunc: func(ctx context.Context, appName, machineID string, nonce string) (*fly.MachineStartResponse, error) {
+			started = true
+
+			return nil, nil
+		},
+		RestartFunc: func(ctx context.Context, appName string, input fly.RestartMachineInput, nonce string) error {
+			if couldNotReserveResources {
+				return &flaps.FlapsError{
+					OriginalError: fmt.Errorf("failed to restart VM xyzabc: unknown: could not reserve resource for machine: insufficient memory available to fulfill request"),
+				}
+			}
+
+			return nil
+		},
+		WaitFunc: func(ctx context.Context, appName string, machineID string, waitOpts ...flaps.WaitOption) (err error) {
+			return nil
+		},
+	}
+
+	ctx = flapsutil.NewContextWithClient(ctx, &flapsClient)
+	err := startOrRestartBuilderMachine(ctx, "", &fly.Machine{ID: "bigmachine"})
+	assert.NoError(t, err)
+	err = startOrRestartBuilderMachine(ctx, "", &fly.Machine{ID: "bigmachine", State: "stopped"})
+	assert.NoError(t, err)
+	assert.True(t, started)
+
+	couldNotReserveResources = true
+	err = startOrRestartBuilderMachine(ctx, "", &fly.Machine{ID: "bigmachine"})
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ShouldReplaceBuilderMachine)
+}

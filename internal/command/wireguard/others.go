@@ -1,0 +1,156 @@
+package wireguard
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"text/template"
+
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flyutil"
+	"github.com/superfly/flyctl/internal/prompt"
+	"github.com/superfly/flyctl/internal/uiex"
+	"github.com/superfly/flyctl/internal/uiexutil"
+	"github.com/superfly/flyctl/iostreams"
+)
+
+func argOrPrompt(ctx context.Context, nth int, msg string) (string, error) {
+	args := flag.Args(ctx)
+	if len(args) >= (nth + 1) {
+		return args[nth], nil
+	}
+
+	val := ""
+	err := prompt.String(ctx, &val, msg, "", false)
+
+	return val, err
+}
+
+func orgByArg(ctx context.Context) (*uiex.Organization, error) {
+	args := flag.Args(ctx)
+
+	if len(args) == 0 {
+		org, err := prompt.Org(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		return org, nil
+	}
+
+	return uiexutil.ClientFromContext(ctx).GetOrganization(ctx, args[0])
+}
+
+func resolveOutputWriter(ctx context.Context, idx int, msg string) (w io.WriteCloser, mustClose bool, err error) {
+	io := iostreams.FromContext(ctx)
+
+	args := flag.Args(ctx)
+	fromCLI := len(args) > idx
+	var filename string
+
+	for {
+		switch filename, err = argOrPrompt(ctx, idx, msg); {
+		case prompt.IsNonInteractive(err):
+			return nil, false, prompt.NonInteractiveError("file argument must be specified when not running interactively")
+		case err != nil:
+			return nil, false, err
+		}
+
+		if filename == "" {
+			if fromCLI {
+				return nil, false, fmt.Errorf("output filename cannot be empty")
+			}
+
+			fmt.Fprintln(io.Out, "Provide a filename (or 'stdout')")
+
+			continue
+		}
+
+		if filename == "stdout" {
+			return os.Stdout, false, nil
+		}
+
+		f, openErr := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if openErr == nil {
+			return f, true, nil
+		}
+
+		if fromCLI {
+			return nil, false, openErr
+		}
+
+		fmt.Fprintf(io.Out, "Can't create '%s': %s\n", filename, openErr)
+		fromCLI = false
+	}
+}
+
+func generateWgConf(peer *fly.CreatedWireGuardPeer, privkey string, w io.Writer) {
+	templateStr := `
+[Interface]
+PrivateKey = {{.Meta.Privkey}}
+Address = {{.Peer.Peerip}}/120
+DNS = {{.Meta.DNS}}
+
+[Peer]
+PublicKey = {{.Peer.Pubkey}}
+AllowedIPs = {{.Meta.AllowedIPs}}
+Endpoint = {{.Peer.Endpointip}}:51820
+PersistentKeepalive = 15
+
+`
+	data := struct {
+		Peer *fly.CreatedWireGuardPeer
+		Meta struct {
+			Privkey    string
+			AllowedIPs string
+			DNS        string
+		}
+	}{
+		Peer: peer,
+	}
+
+	addr := net.ParseIP(peer.Peerip).To16()
+	for i := 6; i < 16; i++ {
+		addr[i] = 0
+	}
+
+	// BUG(tqbf): can't stay this way
+	data.Meta.AllowedIPs = fmt.Sprintf("%s/48", addr)
+
+	addr[15] = 3
+
+	data.Meta.DNS = addr.String()
+	data.Meta.Privkey = privkey
+
+	tmpl := template.Must(template.New("name").Parse(templateStr))
+	tmpl.Execute(w, &data)
+}
+
+func selectWireGuardPeer(ctx context.Context, client flyutil.Client, slug string) (string, error) {
+	peers, err := client.GetWireGuardPeers(ctx, slug)
+	if err != nil {
+		return "", err
+	}
+
+	if len(peers) < 1 {
+		return "", fmt.Errorf(`Organization "%s" does not have any wireguard peers`, slug)
+	}
+
+	var options []string
+	for _, peer := range peers {
+		options = append(options, peer.Name)
+	}
+
+	selectedPeer := 0
+	switch err := prompt.Select(ctx, &selectedPeer, "Select peer:", "", options...); {
+	case prompt.IsNonInteractive(err):
+		return "", prompt.NonInteractiveError("name argument must be specified when not running interactively")
+	case err != nil:
+		return "", err
+	}
+
+	return peers[selectedPeer].Name, nil
+}

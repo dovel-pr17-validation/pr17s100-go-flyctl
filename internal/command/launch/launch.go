@@ -1,0 +1,530 @@
+package launch
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/docker/go-units"
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/fly-go/flaps"
+	"github.com/superfly/flyctl/helpers"
+	"github.com/superfly/flyctl/internal/appconfig"
+	"github.com/superfly/flyctl/internal/appsecrets"
+	"github.com/superfly/flyctl/internal/command/launch/plan"
+	"github.com/superfly/flyctl/internal/command/mpg"
+	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/flag/flagnames"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/internal/prompt"
+	"github.com/superfly/flyctl/internal/tracing"
+	"github.com/superfly/flyctl/iostreams"
+)
+
+// Launch launches the app described by the plan. This is the main entry point for launching a plan.
+func (state *launchState) Launch(ctx context.Context) (err error) {
+	ctx, span := tracing.GetTracer().Start(ctx, "state.launch")
+	defer span.End()
+
+	io := iostreams.FromContext(ctx)
+
+	if err := state.updateComputeFromDeprecatedGuestFields(ctx); err != nil {
+		return err
+	}
+
+	state.updateConfig(ctx)
+
+	if err := state.validateExtensions(ctx); err != nil {
+		return err
+	}
+
+	org, err := state.orgCompact(ctx)
+	if err != nil {
+		return err
+	}
+	if !planValidateHighAvailability(ctx, state.Plan, org.Billable, !state.warnedNoCcHa) {
+		state.Plan.HighAvailability = false
+		state.warnedNoCcHa = true
+	}
+
+	planStep := plan.GetPlanStep(ctx)
+	createdAppName := ""
+
+	if !noCreateApp(ctx) && (planStep == "" || planStep == "create") {
+		app, err := state.createApp(ctx)
+		if err != nil {
+			return err
+		}
+		createdAppName = app.Name
+
+		colorize := io.ColorScheme()
+		fmt.Fprintf(io.Out, "%s\n\n", colorize.Green(fmt.Sprintf("Created app '%s' in organization '%s'", app.Name, app.Organization.Slug)))
+		fmt.Fprintf(io.Out, "Admin URL: %s\n", colorize.Purple(fmt.Sprintf("https://fly.io/apps/%s", app.Name)))
+		fmt.Fprintf(io.Out, "Hostname: %s\n", colorize.Purple(fmt.Sprintf("%s.fly.dev", app.Name)))
+
+		if planStep == "create" {
+			return nil
+		}
+	}
+
+	if !noCreateApp(ctx) {
+		if err = state.confirmManagedPostgresCreation(ctx, createdAppName, planStep); err != nil {
+			return err
+		}
+	}
+
+	flapsClient := flapsutil.ClientFromContext(ctx)
+
+	// TODO: ideally this would be passed as a part of the plan to the Launch UI
+	// and allow choices of what actions are desired to be make there.
+	if state.sourceInfo != nil && state.sourceInfo.GitHubActions.Deploy {
+		if planStep == "" || planStep == "generate" {
+			if err = state.setupGitHubActions(ctx, state.Plan.AppName); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err = state.satisfyScannerBeforeDb(ctx); err != nil {
+		return err
+	}
+	// TODO: Return rich info about provisioned DBs, including things
+	//       like public URLs.
+
+	// A failed database or storage provider stops the launch just before the
+	// deploy rather than here, so fly.toml still gets written and `fly deploy`
+	// works once the failure is fixed.
+	var dbErr error
+	if !noCreateApp(ctx) && planStep != "generate" {
+		dbErr = state.createDatabases(ctx)
+	}
+
+	// A later step can fail too; keep this error and its recovery steps.
+	defer func() {
+		if dbErr != nil && err != nil && !errors.Is(err, dbErr) {
+			err = errors.Join(err, dbErr)
+		}
+	}()
+
+	if planStep != "" && planStep != "deploy" && planStep != "generate" {
+		return dbErr
+	}
+
+	if planStep == "" || planStep == "generate" {
+		if err = state.satisfyScannerAfterDb(ctx); err != nil {
+			return err
+		}
+		if err = state.createDockerIgnore(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Sentry
+	if !noCreateApp(ctx) {
+		if err = state.launchSentry(ctx, state.Plan.AppName); err != nil {
+			return err
+		}
+	}
+
+	if planStep != "generate" {
+		// Override internal port if requested using --internal-port flag
+		if n := flag.GetInt(ctx, "internal-port"); n > 0 {
+			state.appConfig.SetInternalPort(n)
+		}
+	}
+
+	// if the user specified a command, set it in the app config
+	if flag.GetString(ctx, "command") != "" {
+		if state.appConfig.Processes == nil {
+			state.appConfig.Processes = make(map[string]string)
+		}
+
+		state.appConfig.Processes["app"] = flag.GetString(ctx, "command")
+	}
+
+	volumes := flag.GetStringSlice(ctx, "volume")
+	if len(volumes) > 0 {
+		v := volumes[0]
+		splittedIDDestOpts := strings.Split(v, ":")
+
+		if len(splittedIDDestOpts) < 2 {
+			re := regexp.MustCompile(`(?m)^VOLUME\s+(\[\s*")?(\/[\w\/]*?(\w+))("\s*\])?\s*$`)
+			m := re.FindStringSubmatch(splittedIDDestOpts[0])
+
+			if len(m) > 0 {
+				state.appConfig.Mounts = []appconfig.Mount{
+					{
+						Source:      m[3], // last part of path
+						Destination: m[2], // full path
+					},
+				}
+			}
+		} else {
+			// if the user specified a volume, set it in the app config
+			state.appConfig.Mounts = []appconfig.Mount{
+				{
+					Source:      splittedIDDestOpts[0],
+					Destination: splittedIDDestOpts[1],
+				},
+			}
+
+			if len(splittedIDDestOpts) > 2 {
+				if err := ParseMountOptions(&state.appConfig.Mounts[0], splittedIDDestOpts[2]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Finally write application configuration to fly.toml
+	configDir, configFile := filepath.Split(state.configPath)
+	configFileOverride := flag.GetString(ctx, flagnames.AppConfigFilePath)
+	if configFileOverride != "" {
+		configFile = configFileOverride
+	}
+
+	// Resolve config format flags if applicable
+	if flag.GetBool(ctx, "json") {
+		configFile = strings.TrimSuffix(configFile, filepath.Ext(configFile)) + ".json"
+	} else if flag.GetBool(ctx, "yaml") {
+		configFile = strings.TrimSuffix(configFile, filepath.Ext(configFile)) + ".yaml"
+	}
+
+	configPath := filepath.Join(configDir, configFile)
+	state.appConfig.SetConfigFilePath(configPath)
+	if err := state.appConfig.WriteToDisk(ctx, configPath); err != nil {
+		return err
+	}
+
+	// Add secrets to the app
+	if secretsFlag := flag.GetStringArray(ctx, "secret"); len(secretsFlag) > 0 {
+		secrets := make(map[string]string, len(secretsFlag))
+		for _, secret := range secretsFlag {
+			kv := strings.SplitN(secret, "=", 2)
+			if len(kv) != 2 {
+				return fmt.Errorf("invalid secret format: %s, expected NAME=VALUE", secret)
+			}
+			key := strings.TrimSpace(kv[0])
+			value := strings.TrimSpace(kv[1])
+			secrets[key] = value
+		}
+
+		if err := appsecrets.Update(ctx, flapsClient, state.appConfig.AppName, secrets, nil); err != nil {
+			return err
+		}
+	}
+
+	if dbErr != nil {
+		return fmt.Errorf("app %s was created, but provisioning failed:\n%w\n`fly deploy` doesn't provision anything: add what failed with the command above, then run %s, or run it now to deploy without it", state.Plan.AppName, dbErr, deployHint(state.workingDir, configPath))
+	}
+
+	if state.sourceInfo != nil {
+		if state.appConfig.Deploy != nil && state.appConfig.Deploy.SeedCommand != "" {
+			ctx = appconfig.WithSeedCommand(ctx, state.appConfig.Deploy.SeedCommand)
+		}
+
+		if err := state.firstDeploy(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (state *launchState) confirmManagedPostgresCreation(ctx context.Context, createdAppName, planStep string) error {
+	if !state.willCreateManagedPostgresCluster(planStep) {
+		return nil
+	}
+
+	io := iostreams.FromContext(ctx)
+	if !io.IsInteractive() || flag.GetYes(ctx) {
+		return nil
+	}
+
+	var selectedIndex int
+	if err := prompt.Select(ctx, &selectedIndex, state.managedPostgresCreationPrompt(), "",
+		"Yes, proceed and create the MPG cluster",
+		"No, launch the app without the MPG cluster",
+		"No, cancel this launch and let me start over",
+	); err != nil {
+		return err
+	}
+
+	switch selectedIndex {
+	case 0:
+		return nil
+	case 1:
+		state.launchWithoutManagedPostgresCluster()
+
+		return nil
+	}
+
+	if createdAppName != "" {
+		fmt.Fprintf(io.Out, "Deleting app %s...\n", createdAppName)
+		if err := flapsutil.ClientFromContext(ctx).DeleteApp(ctx, createdAppName); err != nil {
+			return fmt.Errorf("launch canceled, but failed to delete app %s: %w", createdAppName, err)
+		}
+		fmt.Fprintf(io.Out, "Deleted app %s\n", createdAppName)
+	}
+
+	return errors.New("launch canceled")
+}
+
+func (state *launchState) launchWithoutManagedPostgresCluster() {
+	state.Plan.Postgres.ManagedPostgres = nil
+}
+
+func (state *launchState) managedPostgresCreationPrompt() string {
+	pgPlan := state.Plan.Postgres.ManagedPostgres
+	dbName := pgPlan.GetDbName(state.Plan)
+	region := pgPlan.GetRegion(state.Plan)
+
+	if planDetails, ok := mpg.MPGPlans[pgPlan.Plan]; ok {
+		return fmt.Sprintf("This launch will create a new Managed Postgres database, %q, on the %s plan ($%d/mo) in %s. This is an additional paid resource. How would you like to proceed?",
+			dbName, planDetails.Name, planDetails.PricePerMo, region)
+	}
+
+	return fmt.Sprintf("This launch will create a new Managed Postgres database, %q, on plan %s in %s. This is an additional paid resource. How would you like to proceed?",
+		dbName, pgPlan.Plan, region)
+}
+
+func (state *launchState) willCreateManagedPostgresCluster(planStep string) bool {
+	return state.Plan.Postgres.ManagedPostgres != nil &&
+		state.Plan.Postgres.ManagedPostgres.ClusterID == "" &&
+		(planStep == "" || planStep == "postgres")
+}
+
+func ParseMountOptions(mount *appconfig.Mount, options string) error {
+	if options == "" {
+		return nil
+	}
+
+	pairs := strings.SplitSeq(options, ",")
+	for pair := range pairs {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			return fmt.Errorf("invalid mount option: %s", pair)
+		}
+		key := strings.TrimSpace(kv[0])
+		value := strings.TrimSpace(kv[1])
+
+		switch key {
+		case "initial_size":
+			mount.InitialSize = value
+		case "snapshot_retention":
+			ret, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid value for snapshot_retention: %s", value)
+			}
+			mount.SnapshotRetention = &ret
+		case "scheduled_snapshots":
+			ret, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid value for scheduled_snapshots: %s", value)
+			}
+			mount.ScheduledSnapshots = &ret
+		case "auto_extend_size_threshold":
+			threshold, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid value for auto_extend_size_threshold: %s", value)
+			}
+			mount.AutoExtendSizeThreshold = threshold
+		case "auto_extend_size_increment":
+			mount.AutoExtendSizeIncrement = value
+		case "auto_extend_size_limit":
+			mount.AutoExtendSizeLimit = value
+		default:
+			return fmt.Errorf("unknown mount option: %s", key)
+		}
+	}
+
+	return nil
+}
+
+// Apply the freestanding Guest fields to the appConfig's Compute field
+// This is temporary, but allows us to start using Compute-based plans in flyctl *now* while the UI catches up in time.
+func (state *launchState) updateComputeFromDeprecatedGuestFields(ctx context.Context) error {
+	if len(state.Plan.Compute) != 0 {
+		// If the UI returns a compute field, then we don't need to do any forward-compat patching.
+		return nil
+	}
+	// Fallback for versions of the UI that don't support a Compute field in the Plan.
+
+	defer func() {
+		// Set the plan's compute field to the calculated compute field.
+		// This makes sure that code expecting a compute definition in the plan is able to find it
+		// (and that it's up-to-date)
+		state.Plan.Compute = state.appConfig.Compute
+	}()
+
+	if compute := state.appConfig.ComputeForGroup(state.appConfig.DefaultProcessName()); compute != nil {
+		applyGuestToCompute(compute, state.Plan.Guest())
+	} else {
+		state.appConfig.Compute = append(state.appConfig.Compute, guestToCompute(state.Plan.Guest()))
+	}
+
+	return nil
+}
+
+// isComputeValid checks if a compute configuration is valid and can be safely modified
+func isComputeValid(c *appconfig.Compute) bool {
+	return c != nil && c.MachineGuest != nil
+}
+
+// updateConfig populates the appConfig with the plan's values
+func (state *launchState) updateConfig(ctx context.Context) {
+	appConfig := state.appConfig
+	env := state.env
+	plan := state.Plan
+
+	if plan == nil {
+		return
+	}
+
+	appConfig.AppName = plan.AppName
+	appConfig.PrimaryRegion = plan.RegionCode
+	if env != nil {
+		appConfig.SetEnvVariables(env)
+	}
+
+	appConfig.Compute = plan.Compute
+
+	if plan.HttpServicePort != 0 {
+		autostop := fly.MachineAutostopStop
+		autostopFlag := flag.GetString(ctx, "auto-stop")
+
+		if autostopFlag == "off" {
+			autostop = fly.MachineAutostopOff
+		} else if autostopFlag == "suspend" {
+			autostop = fly.MachineAutostopSuspend
+
+			// if any compute has a GPU or more than 2GB of memory, set autostop to stop
+			for _, compute := range appConfig.Compute {
+				if !isComputeValid(compute) {
+					continue
+				}
+				if compute.GPUKind != "" {
+					autostop = fly.MachineAutostopStop
+
+					break
+				}
+
+				if compute.Memory != "" {
+					mb, err := helpers.ParseSize(compute.Memory, units.RAMInBytes, units.MiB)
+					if err != nil || mb >= 2048 {
+						autostop = fly.MachineAutostopStop
+
+						break
+					}
+				}
+			}
+		}
+
+		if appConfig.HTTPService == nil {
+			appConfig.HTTPService = &appconfig.HTTPService{
+				ForceHTTPS:         true,
+				AutoStartMachines:  new(true),
+				AutoStopMachines:   new(autostop),
+				MinMachinesRunning: new(0),
+				Processes:          []string{"app"},
+			}
+		}
+		appConfig.HTTPService.InternalPort = plan.HttpServicePort
+	} else {
+		appConfig.HTTPService = nil
+	}
+
+	// Apply plan-level compute overrides to all compute configurations
+	// Only set fields that haven't already been set (defensive against updateComputeFromDeprecatedGuestFields)
+	if plan.CPUKind != "" {
+		for i := range appConfig.Compute {
+			if isComputeValid(appConfig.Compute[i]) && appConfig.Compute[i].CPUKind == "" {
+				appConfig.Compute[i].CPUKind = plan.CPUKind
+			}
+		}
+	}
+
+	if plan.CPUs != 0 {
+		for i := range appConfig.Compute {
+			if isComputeValid(appConfig.Compute[i]) && appConfig.Compute[i].CPUs == 0 {
+				appConfig.Compute[i].CPUs = plan.CPUs
+			}
+		}
+	}
+
+	if plan.MemoryMB != 0 {
+		for i := range appConfig.Compute {
+			if isComputeValid(appConfig.Compute[i]) && appConfig.Compute[i].MemoryMB == 0 {
+				appConfig.Compute[i].MemoryMB = plan.MemoryMB
+			}
+		}
+	}
+}
+
+// createApp creates the fly.io app for the plan
+func (state *launchState) createApp(ctx context.Context) (*fly.App, error) {
+	org, err := state.orgCompact(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	flapsClient := flapsutil.ClientFromContext(ctx)
+	app, err := flapsClient.CreateApp(ctx, flaps.CreateAppRequest{
+		Name: state.Plan.AppName,
+		Org:  org.Slug,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := flapsClient.WaitForApp(ctx, app.Name); err != nil {
+		return nil, err
+	}
+
+	state.appID = fmt.Sprint(app.InternalNumericID)
+	state.orgID = fmt.Sprint(app.Organization.InternalNumericID)
+
+	return &fly.App{
+		ID:     app.ID,
+		Name:   app.Name,
+		Status: app.Status,
+		Organization: fly.Organization{
+			Slug: app.Organization.Slug,
+		},
+	}, nil
+}
+
+// deployHint says where to run the `fly deploy` that finds the fly.toml at
+// configPath: with --path or --config, plain `fly deploy` searches the
+// current directory. It runs in workingDir, the build context, wherever the
+// config lives. Paths stay out of the command, since no quoting is safe in
+// every shell (PowerShell expands $ in double quotes, cmd.exe %).
+func deployHint(workingDir, configPath string) string {
+	dir, err := filepath.Abs(workingDir)
+	if err != nil {
+		return "`fly deploy`"
+	}
+	config, err := filepath.Abs(configPath)
+	if err != nil {
+		return "`fly deploy`"
+	}
+
+	hint := "`fly deploy`"
+	if cwd, err := os.Getwd(); err != nil || cwd != dir {
+		hint += " in " + dir
+	}
+	if config != filepath.Join(dir, "fly.toml") {
+		rel, err := filepath.Rel(dir, config)
+		if err != nil {
+			rel = config
+		}
+		hint += " with -c " + rel
+	}
+
+	return hint
+}

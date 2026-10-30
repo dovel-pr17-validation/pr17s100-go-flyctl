@@ -1,0 +1,221 @@
+package launch
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/samber/lo"
+	fly "github.com/superfly/fly-go"
+	"github.com/superfly/flyctl/internal/appconfig"
+	"github.com/superfly/flyctl/internal/command/launch/plan"
+	"github.com/superfly/flyctl/internal/flapsutil"
+	"github.com/superfly/flyctl/internal/uiex"
+	"github.com/superfly/flyctl/internal/uiexutil"
+	"github.com/superfly/flyctl/iostreams"
+)
+
+// Let's *try* to keep this struct backwards-compatible as we change it
+type launchPlanSource struct {
+	appNameSource  string
+	regionSource   string
+	orgSource      string
+	computeSource  string
+	postgresSource string
+	redisSource    string
+	tigrisSource   string
+	sentrySource   string
+}
+
+// newDefaultPlanSource creates a launchPlanSource with all fields set to the provided source description
+func newDefaultPlanSource(source string) *launchPlanSource {
+	return &launchPlanSource{
+		appNameSource:  source,
+		regionSource:   source,
+		orgSource:      source,
+		computeSource:  source,
+		postgresSource: source,
+		redisSource:    source,
+		tigrisSource:   source,
+		sentrySource:   source,
+	}
+}
+
+type LaunchManifest struct {
+	Plan       *plan.LaunchPlan  `json:"plan,omitempty"`
+	PlanSource *launchPlanSource `json:"plan_source,omitempty"`
+	Config     *appconfig.Config `json:"config,omitempty"`
+}
+
+type launchState struct {
+	workingDir string
+	configPath string
+	LaunchManifest
+	env map[string]string
+	planBuildCache
+	cache map[string]any
+
+	// appID and orgID are the internal numeric IDs of the app and org,
+	// populated once createApp succeeds, for use in metrics reporting.
+	appID string
+	orgID string
+}
+
+func cacheGrab[T any](cache map[string]any, key string, cb func() (T, error)) (T, error) {
+	if val, ok := cache[key]; ok {
+		return val.(T), nil
+	}
+	val, err := cb()
+	if err != nil {
+		return val, err
+	}
+	cache[key] = val
+
+	return val, nil
+}
+
+func (state *launchState) orgCompact(ctx context.Context) (*uiex.Organization, error) {
+	return state.Org(ctx)
+}
+
+func (state *launchState) Org(ctx context.Context) (*uiex.Organization, error) {
+	return cacheGrab(state.cache, "org,"+state.Plan.OrgSlug, func() (*uiex.Organization, error) {
+		org, err := uiexutil.ClientFromContext(ctx).GetOrganization(ctx, state.Plan.OrgSlug)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get org %q for state: %w", state.Plan.OrgSlug, err)
+		}
+
+		return org, nil
+	})
+}
+
+func (state *launchState) Region(ctx context.Context) (fly.Region, error) {
+	flapsClient := flapsutil.ClientFromContext(ctx)
+	regions, err := cacheGrab(state.cache, "regions", func() ([]fly.Region, error) {
+		regionData, err := flapsClient.GetRegions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		regions := regionData.Regions
+		// Filter out deprecated regions
+		regions = lo.Filter(regions, func(r fly.Region, _ int) bool {
+			return !r.Deprecated
+		})
+
+		return regions, nil
+	})
+	if err != nil {
+		return fly.Region{}, err
+	}
+
+	region, ok := lo.Find(regions, func(r fly.Region) bool {
+		return r.Code == state.Plan.RegionCode
+	})
+	if !ok {
+		return region, fmt.Errorf("region %s not found. Is this a valid region according to `fly platform regions`?", state.Plan.RegionCode)
+	}
+
+	return region, nil
+}
+
+// PlanSummary returns a human-readable summary of the launch plan.
+// Used to confirm the plan before executing it.
+func (state *launchState) PlanSummary(ctx context.Context) (string, error) {
+	// It feels wrong to modify the appConfig here, but in well-formed states these should be identical anyway.
+	state.appConfig.Compute = state.Plan.Compute
+
+	// Expensive but should accurately simulate the whole machine building path, meaning we end up with the same
+	// guest description that will be deployed down the road :)
+	fakeMachine, err := state.appConfig.ToMachineConfig(state.appConfig.DefaultProcessName(), nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve machine guest config: %w", err)
+	}
+	guestStr := fakeMachine.Guest.String()
+
+	if len(state.appConfig.Compute) > 1 {
+		guestStr += fmt.Sprintf(", %d more", len(state.appConfig.Compute)-1)
+	}
+
+	org, err := state.orgCompact(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	region, err := state.Region(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	postgresStr, err := describePostgresPlan(state.Plan)
+	if err != nil {
+		return "", err
+	}
+
+	redisStr, err := describeRedisPlan(ctx, state.Plan.Redis)
+	if err != nil {
+		return "", err
+	}
+
+	tigrisStr, err := describeObjectStoragePlan(state.Plan.ObjectStorage)
+	if err != nil {
+		return "", err
+	}
+
+	rows := [][]string{
+		{"Organization", org.Name, state.PlanSource.orgSource},
+		{"Name", state.Plan.AppName, state.PlanSource.appNameSource},
+		{"Region", region.Name, state.PlanSource.regionSource},
+		{"App Machines", guestStr, state.PlanSource.computeSource},
+		{"Postgres", postgresStr, state.PlanSource.postgresSource},
+		{"Redis", redisStr, state.PlanSource.redisSource},
+		{"Tigris", tigrisStr, state.PlanSource.tigrisSource},
+	}
+
+	if state.PlanSource.sentrySource != "not requested" {
+		rows = append(rows, []string{"Sentry", strconv.FormatBool(state.Plan.Sentry), state.PlanSource.sentrySource})
+	}
+
+	for _, row := range rows {
+		// TODO: This is a hack. It'd be nice to not require a special sentinel value for the description,
+		//       but it works OK for now. I'd special-case on value=="" instead, but that isn't *necessarily*
+		//       a failure case for every field.
+		if row[2] == recoverableSpecifyInUi {
+			row[1] = "<unspecified>"
+		}
+	}
+
+	colLengths := []int{0, 0, 0}
+	for _, row := range rows {
+		for i, col := range row {
+			if len(col) > colLengths[i] {
+				colLengths[i] = len(col)
+			}
+		}
+	}
+
+	io := iostreams.FromContext(ctx)
+	colorize := io.ColorScheme()
+
+	var ret strings.Builder
+	for _, row := range rows {
+
+		label := row[0]
+		value := row[1]
+		source := row[2]
+
+		labelSpaces := strings.Repeat(" ", colLengths[0]-len(label))
+		valueSpaces := strings.Repeat(" ", colLengths[1]-len(value))
+
+		fmt.Fprintf(&ret, "%s: %s%s %s(%s)\n", label, labelSpaces, colorize.Purple(value), valueSpaces, colorize.Yellow(source))
+	}
+
+	return ret.String(), nil
+}
+
+func (state *launchState) validateExtensions(ctx context.Context) error {
+	// This is written a little awkwardly with the expectation
+	// that we'll probably need more validation in the future.
+	// When that happens we can just errors.Join(a(), b(), c()...)
+	return nil
+}

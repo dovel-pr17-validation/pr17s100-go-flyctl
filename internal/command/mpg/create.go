@@ -1,0 +1,204 @@
+package mpg
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/superfly/flyctl/internal/appconfig"
+	"github.com/superfly/flyctl/internal/command"
+	cmdv2 "github.com/superfly/flyctl/internal/command/mpg/v2"
+	"github.com/superfly/flyctl/internal/flag"
+	"github.com/superfly/flyctl/internal/prompt"
+	"github.com/superfly/flyctl/iostreams"
+)
+
+func newCreate() *cobra.Command {
+	const (
+		short = "Create a new Managed Postgres cluster"
+		long  = short + "\n"
+	)
+
+	cmd := command.New("create", short, long, runCreate,
+		command.RequireSession,
+		requireMacaroonToken,
+	)
+
+	flag.Add(
+		cmd,
+		flag.Region(),
+		flag.Org(),
+		flag.String{
+			Name:        "name",
+			Shorthand:   "n",
+			Description: "The name of your Postgres cluster",
+		},
+		flag.Bool{
+			Name:        "v2",
+			Description: "Deprecated: Managed Postgres clusters are always created on v2",
+			Default:     true,
+			Hidden:      true,
+		},
+		flag.String{
+			Name:        "plan",
+			Description: "The plan to use for the Postgres cluster: Basic, Starter, Launch, Scale, Performance",
+		},
+		flag.Int{
+			Name:        "volume-size",
+			Description: "Initial volume size in GB",
+			Default:     10,
+		},
+		flag.Bool{
+			Name:        "enable-postgis-support",
+			Description: "Enable PostGIS for the Postgres cluster",
+			Default:     false,
+		},
+		flag.Int{
+			Name:        "pg-major-version",
+			Description: "The major version of Postgres to use for the Postgres cluster. Supported versions are 16 and 17.",
+			Default:     16,
+		},
+	)
+
+	return cmd
+}
+
+// warnIfV2FlagUsed tells the user that --v2 no longer does anything. The flag is
+// kept so scripts passing it keep working, since cobra rejects unknown flags.
+func warnIfV2FlagUsed(ctx context.Context) {
+	if !flag.IsSpecified(ctx, "v2") {
+		return
+	}
+
+	io := iostreams.FromContext(ctx)
+	fmt.Fprintln(io.ErrOut, io.ColorScheme().Yellow("The '--v2' flag is deprecated and no longer has any effect. Managed Postgres clusters are always created on v2."))
+}
+
+func runCreate(ctx context.Context) error {
+	var (
+		io      = iostreams.FromContext(ctx)
+		appName = flag.GetString(ctx, "name")
+		err     error
+	)
+
+	warnIfV2FlagUsed(ctx)
+
+	if appName == "" {
+		// If no name is provided, try to get the app name from context
+		if appName = appconfig.NameFromContext(ctx); appName != "" {
+			// If we have an app name, use it to create a default database name
+			appName = appName + "-db"
+		} else {
+			// If no app name is available, prompt for a name
+			appName, err = prompt.SelectAppNameWithMsg(ctx, "Choose a database name:")
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	org, err := prompt.Org(ctx)
+	if err != nil {
+		return err
+	}
+
+	pgMajorVersion := flag.GetInt(ctx, "pg-major-version")
+	if pgMajorVersion != 16 && pgMajorVersion != 17 {
+		return fmt.Errorf("invalid Postgres major version: %d. Supported versions are 16 and 17", pgMajorVersion)
+	}
+
+	// Plan selection and validation
+	plan, ok := planKey(flag.GetString(ctx, "plan"))
+	if !ok {
+		if !io.IsInteractive() && flag.IsSpecified(ctx, "plan") {
+			return fmt.Errorf("unknown plan %q; valid plans are %s", flag.GetString(ctx, "plan"), planNames())
+		}
+
+		if io.IsInteractive() {
+			// Prepare a sortable slice of plans
+			type planEntry struct {
+				Key   string
+				Value PlanDetails
+			}
+			var planEntries []planEntry
+			for k, v := range MPGPlans {
+				planEntries = append(planEntries, planEntry{Key: k, Value: v})
+			}
+			// Sort by price
+			sort.Slice(planEntries, func(i, j int) bool {
+				return planEntries[i].Value.PricePerMo < planEntries[j].Value.PricePerMo
+			})
+			// Build options and keys in sorted order
+			var planOptions []string
+			var planKeys []string
+			for _, entry := range planEntries {
+				planOptions = append(planOptions, fmt.Sprintf("%s: %s, %s RAM, $%d/mo", entry.Value.Name, entry.Value.CPU, entry.Value.Memory, entry.Value.PricePerMo))
+				planKeys = append(planKeys, entry.Key)
+			}
+			var selectedIndex int
+			if err := prompt.Select(ctx, &selectedIndex, "Select a plan for your Managed Postgres cluster", planOptions[0], planOptions...); err != nil {
+				return err
+			}
+			plan = planKeys[selectedIndex]
+		} else {
+			plan = "basic" // Default to basic if not interactive
+		}
+	}
+
+	// For ui-ex request we need the real org slug
+	slug := org.Slug
+	if org.Slug == "personal" {
+		slug = org.RawSlug
+	}
+
+	params := &cmdv2.CreateClusterParams{
+		Name:           appName,
+		OrgSlug:        slug,
+		Plan:           plan,
+		PGMajorVersion: pgMajorVersion,
+		StorageInGb:    flag.GetInt(ctx, "volume-size"),
+		PostGISEnabled: flag.GetBool(ctx, "enable-postgis-support"),
+	}
+
+	planDetails := MPGPlans[plan]
+
+	return cmdv2.RunCreate(ctx, org.RawSlug, params, &cmdv2.CreatePlanDisplay{
+		Name:       planDetails.Name,
+		CPU:        planDetails.CPU,
+		Memory:     planDetails.Memory,
+		PricePerMo: planDetails.PricePerMo,
+	})
+}
+
+// planKey returns the MPGPlans key for a plan name given in any case. The keys
+// are what the API expects, so "performance" has to find "Performance" (#4612)
+// rather than be lowercased.
+func planKey(name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	for key := range MPGPlans {
+		if strings.EqualFold(key, name) {
+			return key, true
+		}
+	}
+
+	return "", false
+}
+
+// planNames lists the plans cheapest first, as --plan's help does.
+func planNames() string {
+	keys := slices.SortedFunc(maps.Keys(MPGPlans), func(a, b string) int {
+		return cmp.Compare(MPGPlans[a].PricePerMo, MPGPlans[b].PricePerMo)
+	})
+
+	names := make([]string, len(keys))
+	for i, key := range keys {
+		names[i] = MPGPlans[key].Name
+	}
+
+	return strings.Join(names, ", ")
+}
